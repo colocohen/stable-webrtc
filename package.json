@@ -1,0 +1,36 @@
+{
+  "name": "stable-webrtc",
+  "version": "0.1.0",
+  "description": "A production-grade WebRTC library for Node.js & Browsers. Handles glare, renegotiation conflicts, out-of-order signaling, NAT quirks, and bloated SDPs so you can build reliable real-time apps faster.",
+  "main": "stable-webrtc.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/stable-webrtc.git"
+  },
+  "keywords": [
+    "webrtc",
+    "webrtc stream",
+    "wrtc",
+    "simple-peer",
+    "p2p",
+    "peer-to-peer",
+    "video",
+    "voice",
+    "peer",
+    "datachannel",
+    "data-channels",
+    "peer-connection",
+    "sctp",
+    "stream",
+    "mediastream",
+    "nodejs",
+    "browser",
+    "signaling"
+  ],
+  "author": "colocohen",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/colocohen/stable-webrtc/issues"
+  },
+  "homepage": "https://github.com/colocohen/stable-webrtc#readme"
+}

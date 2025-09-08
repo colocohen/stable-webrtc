@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>StableWebRTC Browser ↔ Node Example</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; background: #fafafa; }
+    h1 { font-size: 1.4rem; }
+    #status { margin: 1rem 0; font-weight: bold; }
+    video { width: 640px; height: 360px; background: #000; border-radius: 12px; display: block; }
+    button { padding: 0.6rem 1.2rem; font-size: 1rem; border-radius: 8px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>StableWebRTC Example: Synthetic Video from Node Server</h1>
+  <div id="status">Idle</div>
+  <button id="startBtn">Connect</button>
+  <video id="remote" autoplay playsinline></video>
+
+  <!-- הספרייה שלך צריכה להיות זמינה ב־bundle או ב־window.Peer -->
+  <!-- כאן אני מניח שstable-webrtc בנוי לדפדפן כמו simple-peer -->
+  <script src="stable-webrtc.js"></script>
+
+  <script>
+    function u8ToB64(u8) {
+        let s = '';
+        for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s);
+    }
+    function b64ToU8(b64) {
+        const s = atob(b64);
+        const u8 = new Uint8Array(s.length);
+        for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+        return u8;
+    }
+
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const remoteEl = document.getElementById('remote');
+
+    function setStatus(txt) {
+      statusEl.textContent = txt;
+      console.log('[client]', txt);
+    }
+
+    startBtn.onclick = () => {
+      startBtn.disabled = true;
+      connect();
+    };
+
+    async function connect() {
+      setStatus('Connecting to WS…');
+      const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(wsProto + '//' + location.host + '/ws');
+
+      let peer;
+
+      ws.onopen = () => {
+        setStatus('WS connected, creating Peer…');
+        peer = new StableWebRTC(); // בבראוזר לא צריך wrtc
+
+        peer.on('signal', sig => {
+            ws.send(JSON.stringify({ type: 'signal', data: { bin: true, data: u8ToB64(sig) } }));
+        });
+
+        peer.on('connect', () => {
+          setStatus('Peer connected! Data channel open.');
+          peer.send('hello from browser');
+        });
+
+        peer.on('data', buf => {
+          try {
+            const txt = new TextDecoder().decode(buf);
+            console.log('[browser] got:', txt);
+          } catch {
+            console.log('[browser] got binary', buf);
+          }
+        });
+
+        peer.on('stream', ms => {
+          setStatus('Got remote track');
+          remoteEl.srcObject = ms;
+        });
+
+        peer.on('error', err => {
+          console.error('[browser] peer error:', err);
+        });
+
+        peer.on('close', () => {
+          setStatus('Peer closed');
+        });
+
+        // שלח לשרת שאנחנו מוכנים והוא יחבר track
+        ws.send(JSON.stringify({ type: 'ready' }));
+      };
+
+      ws.onmessage = ev => {
+        let data;
+        try { data = JSON.parse(ev.data); } catch { return; }
+        if (data.type === 'signal') {
+            const p = data.data;
+            const sig = (p && p.bin) ? b64ToU8(p.data) : (p?.data ?? p);
+            peer.signal(sig);
+        }
+      };
+
+      ws.onclose = () => {
+        setStatus('WS closed');
+      };
+    }
+  </script>
+</body>
+</html>

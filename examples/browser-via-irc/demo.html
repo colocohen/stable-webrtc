@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>IRC + StableWebRTC — Multi-session (ID Routing, Global Outbox, Auto-Reconnect, Camera)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif; margin: 16px; }
+    h3 { margin: 0 0 8px; }
+    .small { font-size: 12px; color: #666; }
+    .status { margin: 8px 0 12px; color: #333; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
+    th { background: #fafafa; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .ok { background: #e8f7ee; color: #0b6; }
+    .warn { background: #fff7e6; color: #a66; }
+    .err { background: #ffeaea; color: #b00; }
+    .muted { color: #777; }
+    code { background: #f7f7f7; padding: 2px 4px; border-radius: 4px; }
+    .row { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+    .row > * { margin: 4px 0; }
+    button { padding: 6px 10px; border: 0; border-radius: 8px; cursor: pointer; background: #0b6; color: #fff; }
+    button.secondary { background: #555; }
+    button:disabled { background: #9acfb9; cursor: default; }
+    .sub { font-size: 12px; color: #666; }
+    /* Media area */
+    #mediaArea { margin-top: 16px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+    .vcard { border: 1px solid #eee; border-radius: 10px; padding: 8px; }
+    .vtitle { font-size: 12px; margin-bottom: 6px; color:#444; }
+    video { width: 100%; height: auto; background: #000; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h3>IRC + StableWebRTC — Multi-session ID Routing</h3>
+  <p class="small">
+    IRC: <code>wss://irc.unrealircd.org:443/websocket</code> • Channel: <code>#websocket</code><br>
+    Manual only. “Connect” creates a new WebRTC session with a fresh <code>id</code>. Incoming sessions are always accepted.
+  </p>
+
+  <div class="row">
+    <div>Channel: <strong id="chanLabel"></strong></div>
+    <div>My nick: <strong id="myNick"></strong></div>
+    <div class="muted">NAMES refresh every <span id="namesSec">30</span>s</div>
+  </div>
+
+  <div class="status" id="status">Waiting…</div>
+
+  <table id="peersTable">
+    <thead>
+      <tr>
+        <th>IRC nick</th>
+        <th>IRC status</th>
+        <th>WebRTC status (latest)</th>
+        <th>Active sessions</th>
+        <th>Latest Conn ID</th>
+        <th>Since</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="peersBody"></tbody>
+  </table>
+
+  <h4 style="margin-top:20px;">Media</h4>
+  <div id="mediaArea"></div>
+
+  <script src="./ircws.js"></script>
+  <script src="./stable-webrtc.js"></script>
+  <script>
+  // ===== Config =====
+  var SERVER = "wss://irc.unrealircd.org:443/";
+  var CHAN   = "#websocket";
+  var NICK   = "StableBot" + Math.floor(Math.random()*10000);
+
+  var NAMES_REFRESH_SEC = 30;
+
+  // IRC line sizing + protocol
+  var SIGNAL_PREFIX = "[SWRTC]";
+  var IRC_LINELEN   = 512;     // updated from 005 if provided
+  var IRC_SAFETY    = 32;      // budget safety
+  var DEFAULT_CHUNK_SIZE = 300;
+
+  // Global IRC outbox (send one message per tick)
+  var OUTBOX_INTERVAL_MS = 200;
+
+  // Timeouts
+  var SIGNAL_TIMEOUT_MS   = 45*1000;
+
+  // Tombstones TTL
+  var TOMBSTONE_TTL_MS    = 60*1000;
+
+  // IRC auto-reconnect
+  var RECONNECT_DELAY_MS  = 5000;
+
+  // Diagnostics
+  var DIAG = true; function dbg(){ if(!DIAG) return; try{ console.log.apply(console, arguments); }catch(e){} }
+
+  // ===== UI =====
+  var elStatus  = document.getElementById('status');
+  var elChanLbl = document.getElementById('chanLabel');
+  var elMyNick  = document.getElementById('myNick');
+  var elNamesSec= document.getElementById('namesSec');
+  var tblBody   = document.getElementById('peersBody');
+  var mediaArea = document.getElementById('mediaArea');
+
+  elChanLbl.textContent = CHAN;
+  elMyNick.textContent  = NICK;
+  elNamesSec.textContent= String(NAMES_REFRESH_SEC);
+
+  function nowTs(){ return Date.now?Date.now():(new Date()).getTime(); }
+  function sinceStr(ts){ if(!ts) return '-'; var s=((nowTs()-ts)/1000)|0; if(s<60) return s+'s'; var m=(s/60)|0,r=s%60; return m+'m'+(r?(' '+r+'s'):''); }
+  function cleanNick(n){ return (n||'').replace(/^[@+%&~]/,''); }
+  function getNickFromPrefix(prefix){ if(!prefix) return ''; var ex=prefix.indexOf('!'); return ex===-1?prefix:prefix.substring(0,ex); }
+  function setStatus(t){ elStatus.textContent = t; }
+  function randHex(len){ var s='',h='0123456789abcdef'; for(var i=0;i<len;i++) s+=h[(Math.random()*16)|0]; return s; }
+
+  // ===== Base64URL <-> Uint8Array =====
+  function u8ToB64url(u8){
+    var CH=0x8000,i=0,s='',sub;
+    while(i<u8.length){ sub=u8.subarray(i,i+CH); s+=String.fromCharCode.apply(null,sub); i+=CH; }
+    var b64 = btoa(s);
+    return b64.replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  }
+  function b64urlToU8(b64u){
+    var b64 = b64u.replace(/-/g,'+').replace(/_/g,'/');
+    while(b64.length % 4) b64 += '=';
+    var bin = atob(b64), len=bin.length, out=new Uint8Array(len);
+    for(var i=0;i<len;i++) out[i]=bin.charCodeAt(i);
+    return out;
+  }
+
+  // ===== Media helpers (local & remote) =====
+  var localStream = null;                 // single shared getUserMedia stream
+  var localUseByKey = Object.create(null); // key -> true if tracks added
+  var remoteVideosByKey = Object.create(null); // key -> HTMLVideoElement
+
+  async function ensureLocalStream(){
+    if(localStream) return localStream;
+    try{
+      localStream = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+      // show a single local preview card (not per-connection) if you want:
+      showOrUpdateLocalPreview(localStream);
+      return localStream;
+    }catch(e){
+      console.warn('getUserMedia failed', e);
+      alert('Camera/Microphone permission denied or unavailable.');
+      throw e;
+    }
+  }
+
+  function showOrUpdateLocalPreview(stream){
+    var id = 'local-preview';
+    var card = document.getElementById(id);
+    if(!card){
+      card = document.createElement('div');
+      card.className = 'vcard';
+      card.id = id;
+      card.innerHTML = '<div class="vtitle">Local preview</div><video id="vid-'+id+'" autoplay playsinline muted></video>';
+      mediaArea.prepend(card);
+    }
+    var v = document.getElementById('vid-'+id);
+    if(v.srcObject !== stream) v.srcObject = stream;
+  }
+
+  function showRemoteVideo(key, stream, label){
+    var id = 'remote-'+key;
+    var card = document.getElementById(id);
+    if(!card){
+      card = document.createElement('div');
+      card.className = 'vcard';
+      card.id = id;
+      card.innerHTML = '<div class="vtitle">'+(label||key)+'</div><video id="vid-'+id+'" autoplay playsinline></video>';
+      mediaArea.appendChild(card);
+    }
+    var v = document.getElementById('vid-'+id);
+    if(v.srcObject !== stream) v.srcObject = stream;
+    remoteVideosByKey[key] = v;
+    v.muted=false;
+    v.play().catch(()=>{ /* ignored; some browsers need loadedmetadata */ });
+
+    console.log(stream);
+    console.log(stream.getTracks());
+  }
+  function removeRemoteVideo(key){
+    var id = 'remote-'+key, card = document.getElementById(id);
+    if(card && card.parentNode) card.parentNode.removeChild(card);
+    delete remoteVideosByKey[key];
+  }
+
+  async function startMediaOnConnection(c){
+    // Do not add media to closed/failed/tombstoned
+    if(!c || !connsByKey[keyOf(c.nick,c.id)]) return;
+    if(c.state===ST_CLOSED || c.state===ST_FAILED) return;
+    if(inTombstone(c.nick, c.id)) return;
+
+    const key = keyOf(c.nick, c.id);
+    const stream = await ensureLocalStream();
+
+    if(localUseByKey[key]) return; // already attached for this connection
+
+    // Prefer addTrack
+    if(typeof c.webrtc.addTrack === 'function'){
+      stream.getTracks().forEach(function(t){ c.webrtc.addTrack(t, stream); });
+    } else if(typeof c.webrtc.addStream === 'function'){
+      c.webrtc.addStream(stream);
+    } else {
+      console.warn('StableWebRTC: no addTrack/addStream available');
+      return;
+    }
+    localUseByKey[key] = true;
+    // no separate local video per-connection; single preview is enough
+  }
+
+  // ===== IRC global outbox =====
+  var Outbox = (function(){
+    var q = [];
+    var timer = null;
+    function tick(){
+      if(!q.length || !conn) return;
+      var item = q.shift();
+      try {
+        conn.privmsg(item.to, item.text);
+        if(DIAG) console.log('[irc outbox] to=%s bytes=%d', item.to, item.text.length);
+      } catch(e) {
+        console.warn('Outbox send error', e);
+      }
+    }
+    function ensure(){ if(!timer) timer = setInterval(tick, OUTBOX_INTERVAL_MS); }
+    return {
+      enqueue: function(to, text){ q.push({to: to, text: text}); ensure(); }
+    };
+  })();
+
+  // ===== IRC connect + auto-reconnect =====
+  var conn = null;
+  var reconnectTimer = null;
+  var namesRefreshTimer = null;
+
+  function scheduleNamesRefresh(){
+    if(namesRefreshTimer) clearInterval(namesRefreshTimer);
+    namesRefreshTimer = setInterval(function(){ if(conn) conn.names(CHAN); }, NAMES_REFRESH_SEC*1000);
+  }
+  function scheduleReconnect(){
+    if(reconnectTimer) return;
+    reconnectTimer = setTimeout(function(){
+      reconnectTimer = null;
+      connectIrc();
+    }, RECONNECT_DELAY_MS);
+  }
+  function connectIrc(){
+    try { if(conn) conn.close(); } catch(e){}
+    conn = IrcWS.create();
+
+    conn.on('numeric', function(code, msg){
+      if(code===5){
+        var line=(msg.params||[]).join(' ');
+        var m=/LINELEN=([0-9]+)/.exec(line);
+        if(m){ IRC_LINELEN=parseInt(m[1],10)||512; dbg('[isupport] LINELEN=%d', IRC_LINELEN); }
+      }
+    });
+
+    conn.on('open', function(proto){
+      setStatus("WebSocket open ("+(proto||"no subprotocol")+") — registering…");
+    });
+    conn.on('welcome', function(){
+      setStatus("Registered. Joining "+CHAN+"…");
+      conn.join(CHAN);
+      setTimeout(function(){ conn.names(CHAN); }, 400);
+    });
+    conn.on('names', function(chan, list){
+      if(chan!==CHAN) return;
+      scheduleNamesRefresh();
+      setStatus("On "+CHAN+" • users: "+list.length);
+      fullSyncUsersToPeers(list);
+    });
+    conn.on('join', function(prefix, channel){
+      if(channel!==CHAN) return;
+      var nick=getNickFromPrefix(prefix);
+      if(!nick || nick.toLowerCase()===NICK.toLowerCase()) return;
+      ircSetOnline(nick,true);
+      renderTable();
+    });
+    conn.on('part', function(prefix, channel){
+      if(channel!==CHAN) return;
+      var nick=getNickFromPrefix(prefix);
+      ircSetOnline(nick,false);
+    });
+    conn.on('quit', function(prefix){
+      var nick=getNickFromPrefix(prefix);
+      ircSetOnline(nick,false);
+    });
+    conn.on('nick', function(prefix, newNick){
+      var oldNick=getNickFromPrefix(prefix);
+      if(!oldNick || !newNick || oldNick===newNick) return;
+      migrateNick(oldNick, newNick);
+      renderTable();
+    });
+
+    conn.on('privmsg', function(from, to, text){
+      var toNick = to, fromNick=getNickFromPrefix(from);
+      if(!fromNick) return;
+      if(toNick.toLowerCase() !== NICK.toLowerCase()) return;
+      var h = parseHeader(text);
+      if(h) onSignalHeader(fromNick, h);
+    });
+
+    conn.on('ws_error', function(){
+      setStatus("WebSocket error. Reconnecting in 5s…");
+      scheduleReconnect();
+    });
+    conn.on('close', function(){
+      setStatus("WebSocket closed. Reconnecting in 5s…");
+      if(namesRefreshTimer){ clearInterval(namesRefreshTimer); namesRefreshTimer=null; }
+      scheduleReconnect();
+    });
+
+    conn.connect(SERVER, {
+      nick: NICK,
+      user: 'stb',
+      realname: '',
+      keepaliveSec: 60,
+      floodDelayMs: 400,
+      subprotocols: ['text.ircv3.net','binary.ircv3.net']
+    });
+  }
+
+  // ===== Presence & collections =====
+  var ircOnline = Object.create(null); // nick -> bool
+
+  function ircSetOnline(nick, on){
+    ircOnline[nick] = !!on;
+    if(!on){ maybeRemoveNick(nick); }
+    ensureNickSlots(nick);
+    renderTable();
+  }
+  function fullSyncUsersToPeers(list){
+    var seen={}, i;
+    for(i=0;i<list.length;i++){
+      var u=cleanNick(list[i]); if(!u) continue;
+      if(u.toLowerCase()===NICK.toLowerCase()) continue;
+      seen[u]=true; ircSetOnline(u,true);
+    }
+    Object.keys(ircOnline).forEach(function(n){
+      if(!seen[n]) ircSetOnline(n,false);
+    });
+    renderTable();
+  }
+
+  // ===== Signaling header & chunking =====
+  function computeChunkSizeFull(targetNick, headerPrefix){
+    var limit  = IRC_LINELEN || 512;
+    var over   = ("PRIVMSG " + targetNick + " :").length;
+    var budget = Math.max(64, limit - IRC_SAFETY - over - headerPrefix.length);
+    return Math.min(DEFAULT_CHUNK_SIZE, budget);
+  }
+  function makeHeader(id, idx, total, kind, extraKVs){
+    var s = SIGNAL_PREFIX + " v=1 id=" + id + " part=" + (idx+1) + "/" + total + " kind=" + kind;
+    if(extraKVs){ for(var k in extraKVs){ s += " " + k + "=" + extraKVs[k]; } }
+    return s + " ";
+  }
+  function splitChunks(str, size){ var out=[],i=0; while(i<str.length){ out.push(str.substr(i,size)); i+=size; } return out; }
+
+  function sendSignalBytes(toNick, bytesU8, id){
+    var base64 = u8ToB64url(bytesU8);
+    var probe  = makeHeader('xxxxxxxx',0,1,"sig");
+    var CHUNK_SIZE = computeChunkSizeFull(toNick, probe);
+    var chunks = splitChunks(base64, CHUNK_SIZE);
+
+    if(DIAG) console.log('[send] to=%s id=%s len=%d chunks=%d size=%d', toNick, id, base64.length, chunks.length, CHUNK_SIZE);
+    for(var i=0;i<chunks.length;i++){
+      var header = makeHeader(id, i, chunks.length, "sig");
+      var line = header + chunks[i];
+      Outbox.enqueue(toNick, line);
+    }
+  }
+  function sendClose(toNick, id){
+    var header = makeHeader(id, 0, 1, "close");
+    Outbox.enqueue(toNick, header);
+  }
+
+  // ===== Multi-session by (nick,id) =====
+  var ST_SIGNALING='signaling', ST_CONNECTED='connected', ST_FAILED='failed', ST_CLOSED='closed';
+
+  function keyOf(nick,id){ return nick + '|' + id; }
+
+  var connsByKey   = Object.create(null); // key -> { nick, id, webrtc, state, stateTs, timer? }
+  var idsByNick    = Object.create(null); // nick -> Set(ids)
+  var lastIdByNick = Object.create(null); // nick -> last created/seen id
+
+  function ensureNickSlots(nick){
+    if(!(nick in idsByNick)) idsByNick[nick] = new Set();
+    if(!(nick in lastIdByNick)) lastIdByNick[nick] = null;
+  }
+  function maybeRemoveNick(nick){
+    var online = ircOnline[nick] === true;
+    var set = idsByNick[nick];
+    var hasAny = set && set.size>0;
+    if(!online && !hasAny){
+      delete idsByNick[nick];
+      delete lastIdByNick[nick];
+      renderTable();
+    }
+  }
+
+  // Tombstones
+  var tombstones = Object.create(null); // key -> expiresAt
+  function addTombstone(nick,id){
+    tombstones[keyOf(nick,id)] = nowTs() + TOMBSTONE_TTL_MS;
+  }
+  function inTombstone(nick,id){
+    var k = keyOf(nick,id), exp=tombstones[k];
+    if(!exp) return false;
+    if(exp < nowTs()){ delete tombstones[k]; return false; }
+    return true;
+  }
+  setInterval(function(){
+    var t=nowTs();
+    Object.keys(tombstones).forEach(function(k){ if(tombstones[k] < t) delete tombstones[k]; });
+  }, 10000);
+
+  function ensureWebRTCForConn(c){
+    if(c.webrtc) return;
+    var webrtc = new StableWebRTC(); // no params
+    c.webrtc = webrtc;
+
+    webrtc.on('signal', function(sigBytesU8){
+      var k = keyOf(c.nick, c.id);
+      if(!connsByKey[k]) return;
+      if(c.state===ST_CLOSED || c.state===ST_FAILED) return;
+      if(inTombstone(c.nick, c.id)) return;
+      sendSignalBytes(c.nick, sigBytesU8, c.id);
+    });
+    webrtc.on('connect', function(){
+      c.state = ST_CONNECTED; c.stateTs = nowTs(); renderTable();
+    });
+    webrtc.on('close', function(){
+      teardownConn(c.nick, c.id, 'close');
+    });
+    webrtc.on('error', function(){
+      teardownConn(c.nick, c.id, 'error');
+    });
+
+    // Receive remote media (simple-peer compatible)
+    webrtc.on('stream', function(remoteStream,obj){
+      console.log(obj);
+      showRemoteVideo(keyOf(c.nick,c.id), remoteStream, c.nick+' | '+c.id);
+    });
+    // Some impls also emit 'track' with (track, stream)
+    webrtc.on('track', function(track, remoteStream){
+      if(remoteStream) showRemoteVideo(keyOf(c.nick,c.id), remoteStream, c.nick+' | '+c.id);
+    });
+  }
+
+  function createConn(nick, id, isIncoming){
+    ensureNickSlots(nick);
+    var k = keyOf(nick,id);
+    if(connsByKey[k]) return connsByKey[k];
+
+    var c = {
+      nick: nick,
+      id: id,
+      webrtc: null,
+      state: ST_SIGNALING,
+      stateTs: nowTs(),
+      timer: null
+    };
+    connsByKey[k] = c;
+    idsByNick[nick].add(id);
+    lastIdByNick[nick] = id;
+
+    ensureWebRTCForConn(c);
+
+    c.timer = setTimeout(function(){
+      var c2 = connsByKey[k];
+      if(c2 && c2.state !== ST_CONNECTED){
+        teardownConn(nick, id, 'signal-timeout');
+      }
+    }, SIGNAL_TIMEOUT_MS);
+
+    renderTable();
+    return c;
+  }
+
+  function teardownConn(nick, id, reason){
+    var k = keyOf(nick,id);
+    var c = connsByKey[k]; 
+    addTombstone(nick,id); // always tombstone first
+    if(!c) return;
+
+    if(c.timer){ clearTimeout(c.timer); c.timer=null; }
+    if(c.webrtc){ try{ c.webrtc.destroy(); }catch(e){} }
+    c.webrtc = null;
+    c.state  = (reason==='manual' ? ST_CLOSED : ST_FAILED);
+    c.stateTs= nowTs();
+
+    if(idsByNick[nick]) idsByNick[nick].delete(id);
+    delete connsByKey[k];
+    delete localUseByKey[k];
+    removeRemoteVideo(k);
+
+    maybeRemoveNick(nick);
+    renderTable();
+  }
+
+  function disconnectAllForNick(nick){
+    ensureNickSlots(nick);
+    var ids = Array.from(idsByNick[nick]);
+    for(var i=0;i<ids.length;i++){
+      var id = ids[i];
+      sendClose(nick, id);
+      teardownConn(nick, id, 'manual');
+    }
+  }
+
+  // ===== Incoming signaling =====
+  var inboxByKey = Object.create(null); // key -> { total, parts[], t0 }
+
+  function parseHeader(text){
+    if(text.indexOf(SIGNAL_PREFIX)!==0) return null;
+    var rest = text.substr(SIGNAL_PREFIX.length).trim();
+    var mId = /id=([^\s]+)/.exec(rest);
+    var mPt = /part=([0-9]+)\/([0-9]+)/.exec(rest);
+    var mKd = /kind=(sig|close)/.exec(rest);
+    if(!mId||!mPt||!mKd) return null;
+    var afterKindIdx = rest.indexOf(' ', rest.indexOf('kind='));
+    var payload = afterKindIdx===-1 ? '' : rest.substr(afterKindIdx+1).trim();
+    return {
+      id: mId[1],
+      idx: parseInt(mPt[1],10)-1,
+      total: parseInt(mPt[2],10),
+      kind: mKd[1],
+      payloadB64: payload
+    };
+  }
+
+  function onSignalHeader(fromNick, h){
+    var key = keyOf(fromNick, h.id);
+    if(DIAG) console.log('[recv] key=%s part=%d/%d kind=%s len=%d',
+      key, h.idx+1, h.total, h.kind, (h.payloadB64||'').length);
+
+    if(inTombstone(fromNick, h.id)){
+      if(DIAG) console.log('[recv] ignored: tombstoned %s', key);
+      return;
+    }
+
+    if(h.kind==='close'){
+      teardownConn(fromNick, h.id, 'remote-close');
+      return;
+    }
+
+    var rec = inboxByKey[key];
+    if(!rec){
+      rec = inboxByKey[key] = { total:h.total, parts:new Array(h.total), t0:nowTs() };
+    }
+    rec.parts[h.idx] = h.payloadB64 || '';
+
+    for(var i=0;i<rec.total;i++){ if(typeof rec.parts[i] !== 'string') return; }
+    delete inboxByKey[key];
+
+    var b64 = rec.parts.join('');
+    var u8;
+    try{ u8 = b64urlToU8(b64); }catch(e){ console.warn('decode fail',e); return; }
+
+    var c = connsByKey[key];
+    if(!c){
+      c = createConn(fromNick, h.id, true);
+    }
+
+    if(!c.webrtc || c.state===ST_CLOSED || c.state===ST_FAILED || inTombstone(fromNick, h.id)){
+      if(DIAG) console.log('[recv] drop: closed/failed/tombstoned %s', key);
+      return;
+    }
+
+    try { c.webrtc.signal(u8); }
+    catch(e){
+      console.warn('stablewebrtc.signal error', e);
+      teardownConn(c.nick, c.id, 'bad-signal');
+    }
+  }
+
+  // ===== UI table =====
+  function statePill(st){
+    if(st===ST_CONNECTED) return '<span class="pill ok">Connected</span>';
+    if(st===ST_SIGNALING) return '<span class="pill warn">Signaling…</span>';
+    if(st===ST_FAILED)    return '<span class="pill err">Failed</span>';
+    if(st===ST_CLOSED)    return '<span class="pill muted">Closed</span>';
+    return '<span class="pill muted">Idle</span>';
+  }
+  function ircPill(on){ return on?'<span class="pill ok">Online</span>':'<span class="pill err">Offline</span>'; }
+
+  function renderTable(){
+    var allNicks = Object.create(null);
+    Object.keys(ircOnline).forEach(function(n){ allNicks[n]=true; });
+    Object.keys(idsByNick).forEach(function(n){ allNicks[n]=true; });
+
+    var nicks = Object.keys(allNicks).sort(function(a,b){a=a.toLowerCase();b=b.toLowerCase();return a<b?-1:1;});
+    var rows='';
+    for(var i=0;i<nicks.length;i++){
+      var nick=nicks[i];
+      var set = idsByNick[nick] || new Set();
+      var count = set.size;
+
+      var idLast = lastIdByNick[nick];
+      if(idLast && !set.has(idLast)){
+        idLast = set.size ? Array.from(set)[set.size-1] : null;
+        lastIdByNick[nick] = idLast || null;
+      }
+      var k = (idLast? keyOf(nick,idLast): null);
+      var c = k? connsByKey[k] : null;
+      var st = c? c.state : (count? ST_SIGNALING : ST_CLOSED);
+      var ts = c? c.stateTs : null;
+
+      var canConnect    = (ircOnline[nick]===true);
+      var canDisconnect = (count>0);
+      var canStartCam   = !!(c && c.state===ST_CONNECTED);
+
+      rows += '<tr>'+
+        '<td><strong>'+nick+'</strong></td>'+
+        '<td>'+ircPill(ircOnline[nick]===true)+'</td>'+
+        '<td>'+statePill(st)+'</td>'+
+        '<td>'+count+' <span class="sub">sessions</span></td>'+
+        '<td><code>'+((idLast)||'-')+'</code></td>'+
+        '<td>'+sinceStr(ts)+'</td>'+
+        '<td>'+
+          '<button onclick="window.__ops.connect(\''+nick+'\')" '+(!canConnect?'disabled':'')+'>Connect</button> '+
+          '<button class="secondary" onclick="window.__ops.disconnect(\''+nick+'\')" '+(!canDisconnect?'disabled':'')+'>Disconnect (all)</button> '+
+          '<button class="secondary" onclick="window.__ops.startCamera(\''+nick+'\')" '+(!canStartCam?'disabled':'')+'>Start Camera</button>'+
+        '</td>'+
+      '</tr>';
+    }
+    tblBody.innerHTML = rows;
+  }
+
+  window.__ops = {
+    connect: function(nick){
+      if(ircOnline[nick]!==true) return;
+      var id = randHex(16);
+      createConn(nick, id, false);
+    },
+    disconnect: function(nick){
+      disconnectAllForNick(nick);
+    },
+    startCamera: async function(nick){
+      // Use the latest connection for that nick (you can expand UI later to per-id control)
+      var idLast = lastIdByNick[nick];
+      if(!idLast) return;
+      var c = connsByKey[keyOf(nick,idLast)];
+      if(!c || c.state!==ST_CONNECTED) return;
+      try { await startMediaOnConnection(c); }
+      catch(e){ /* user denied or device issue; already alerted */ }
+    }
+  };
+
+  // ===== Nick migration =====
+  function migrateNick(oldNick, newNick){
+    if(idsByNick[oldNick]){
+      ensureNickSlots(newNick);
+      Array.from(idsByNick[oldNick]).forEach(function(id){
+        var oldKey = keyOf(oldNick,id), newKey = keyOf(newNick,id);
+        if(connsByKey[oldKey]){
+          connsByKey[newKey] = connsByKey[oldKey];
+          connsByKey[newKey].nick = newNick;
+          delete connsByKey[oldKey];
+        }
+        if(inboxByKey[oldKey]){
+          inboxByKey[newKey] = inboxByKey[oldKey];
+          delete inboxByKey[oldKey];
+        }
+        if(tombstones[oldKey]){
+          tombstones[newKey] = tombstones[oldKey];
+          delete tombstones[oldKey];
+        }
+        if(localUseByKey[oldKey]){
+          localUseByKey[newKey] = true;
+          delete localUseByKey[oldKey];
+        }
+        // Remote video tile
+        var rv = remoteVideosByKey[oldKey];
+        if(rv){
+          removeRemoteVideo(oldKey);
+          showRemoteVideo(newKey, rv.srcObject, newNick+' | '+id);
+        }
+      });
+      idsByNick[newNick] = new Set(Array.from(idsByNick[oldNick]));
+      delete idsByNick[oldNick];
+    }
+    if(lastIdByNick[oldNick] !== undefined){
+      lastIdByNick[newNick] = lastIdByNick[oldNick];
+      delete lastIdByNick[oldNick];
+    }
+    if(ircOnline[oldNick] !== undefined){
+      ircOnline[newNick] = ircOnline[oldNick];
+      delete ircOnline[oldNick];
+    }
+  }
+
+  // ===== Start IRC =====
+  connectIrc();
+  </script>
+</body>
+</html>
