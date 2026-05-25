@@ -2454,17 +2454,22 @@ var StableWebRTCModule = (() => {
     function drain_pending_remote_candidates() {
       if (connection.pc && connection.pc.connectionState !== "closed" && connection.pc.remoteDescription && connection.pc.remoteDescription.type) {
         var current_remote_ufrag = get_ufrag_from_sdp(connection.pc.remoteDescription.sdp);
-        if (current_remote_ufrag && current_remote_ufrag in connection.list_remote_candidates) {
-          if (connection.list_remote_candidates[current_remote_ufrag].pending.length > 0) {
-            var candidate = connection.list_remote_candidates[current_remote_ufrag].pending.shift();
-            connection.list_remote_candidates[current_remote_ufrag].drained++;
+        var buckets = [];
+        if (current_remote_ufrag && current_remote_ufrag in connection.list_remote_candidates) buckets.push(current_remote_ufrag);
+        if ("default" in connection.list_remote_candidates && current_remote_ufrag !== "default") buckets.push("default");
+        for (var bi = 0; bi < buckets.length; bi++) {
+          var bucket = connection.list_remote_candidates[buckets[bi]];
+          if (bucket.pending.length > 0) {
+            var candidate = bucket.pending.shift();
+            bucket.drained++;
             connection.pc.addIceCandidate(candidate).then(function() {
               setTimeout(drain_pending_remote_candidates, 0);
             }).catch(function(error) {
               ev.emit("error", error);
               setTimeout(drain_pending_remote_candidates, 0);
             });
-          } else if (connection.list_remote_candidates[current_remote_ufrag].total > 0 && connection.list_remote_candidates[current_remote_ufrag].drained == connection.list_remote_candidates[current_remote_ufrag].total) {
+            return;
+          } else if (bucket.total > 0 && bucket.drained == bucket.total) {
             connection.pc.addIceCandidate(null);
           }
         }
@@ -2475,11 +2480,11 @@ var StableWebRTCModule = (() => {
         connection.remote_support_trickle_ice = true;
       }
       var of_ufrag = "default";
-      if (candidate && "usernameFragment" in candidate && candidate.usernameFragment.length > 0) {
+      if (candidate && typeof candidate.usernameFragment === "string" && candidate.usernameFragment.length > 0) {
         of_ufrag = candidate.usernameFragment;
       } else {
         var c = parse_candidate(candidate.candidate);
-        if ("ufrag" in c && c.ufrag.length > 0) {
+        if (typeof c.ufrag === "string" && c.ufrag.length > 0) {
           of_ufrag = c.ufrag;
         }
       }
@@ -3270,7 +3275,7 @@ var StableWebRTCModule = (() => {
           try {
             if (connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport && "onselectedcandidatepairchange" in connection.pc.sctp.transport.iceTransport) {
               connection.pc.sctp.transport.iceTransport.onselectedcandidatepairchange = function() {
-                selected_candidate_pair = connection.pc.sctp.transport.iceTransport.getSelectedCandidatePair();
+                var selected_candidate_pair = connection.pc.sctp.transport.iceTransport.getSelectedCandidatePair();
                 set_connection_state({
                   local_protocol: selected_candidate_pair.local.protocol,
                   remote_protocol: selected_candidate_pair.remote.protocol
@@ -4636,7 +4641,7 @@ var StableWebRTCModule = (() => {
     function addStream(stream2, options) {
       if (stream2 && isMediaStream(stream2)) {
         var mediastream_id = null;
-        if ("id" in stream2 && stream2.id.length > 0) {
+        if (typeof stream2.id === "string" && stream2.id.length > 0) {
           mediastream_id = stream2.id;
         }
         var for_tag_id = mediastream_id;
@@ -4668,7 +4673,7 @@ var StableWebRTCModule = (() => {
     function removeStream(stream2) {
       if (stream2 && isMediaStream(stream2)) {
         var mediastream_id = null;
-        if ("id" in stream2 && stream2.id.length > 0) {
+        if (typeof stream2.id === "string" && stream2.id.length > 0) {
           mediastream_id = stream2.id;
         }
         for (var tag_id in connection.list_sending_live_mediastream) {
@@ -4687,7 +4692,7 @@ var StableWebRTCModule = (() => {
     function addTrack(track, stream2, options) {
       if (stream2 && isMediaStream(stream2)) {
         var mediastream_id = null;
-        if ("id" in stream2 && stream2.id.length > 0) {
+        if (typeof stream2.id === "string" && stream2.id.length > 0) {
           mediastream_id = stream2.id;
         }
         var for_tag_id = mediastream_id;
@@ -4717,7 +4722,7 @@ var StableWebRTCModule = (() => {
     function removeTrack(track, stream2) {
       var mediastream_id = null;
       if (stream2 && isMediaStream(stream2)) {
-        if ("id" in stream2 && stream2.id.length > 0) {
+        if (typeof stream2.id === "string" && stream2.id.length > 0) {
           mediastream_id = stream2.id;
         }
       }
@@ -5163,7 +5168,7 @@ var StableWebRTCModule = (() => {
       if (candidate_json.candidate && candidate_json.candidate.length > 0) {
         try {
           var p = parse_candidate(candidate_json.candidate);
-          if (p.ufrag == null && "usernameFragment" in candidate_json) {
+          if (p.ufrag == null && typeof candidate_json.usernameFragment === "string" && candidate_json.usernameFragment.length > 0) {
             p.ufrag = candidate_json.usernameFragment;
           }
           var uint8buffer = encode_candidate_binary(p, candidate_json.sdpMid, candidate_json.sdpMLineIndex, candidate_json.ufrag);
@@ -5182,7 +5187,7 @@ var StableWebRTCModule = (() => {
         connection.pc = new RTCPeerConnection(connection.pc_config);
         connection.pc.onicecandidate = function(event) {
           if (connection.pc) {
-            if (event.candidate == null || event.candidate && "usernameFragment" in event.candidate && event.candidate.usernameFragment.length <= 0) {
+            if (event.candidate == null || event.candidate && typeof event.candidate.usernameFragment === "string" && event.candidate.usernameFragment.length <= 0) {
               send_total_candidates();
             } else {
               if (connection.local_support_trickle_ice == null) {
@@ -5197,11 +5202,11 @@ var StableWebRTCModule = (() => {
                 send_candidate(candidate_json);
               }
               var of_ufrag = "default";
-              if ("usernameFragment" in candidate_json && candidate_json.usernameFragment.length > 0) {
+              if (typeof candidate_json.usernameFragment === "string" && candidate_json.usernameFragment.length > 0) {
                 of_ufrag = candidate_json.usernameFragment;
               } else {
                 var c = parse_candidate(candidate_json.candidate);
-                if ("ufrag" in c && c.ufrag.length > 0) {
+                if (typeof c.ufrag === "string" && c.ufrag.length > 0) {
                   of_ufrag = c.ufrag;
                 }
               }
@@ -5339,10 +5344,11 @@ var StableWebRTCModule = (() => {
           let try_create_dc = function() {
             connection.create_data_channel_timer = null;
             if (connection.pc && connection.pc.connectionState !== "closed") {
-              var need_dc = connection.pc.sctp == null && connection.list_data_channels.length == 0 && connection.negotiation_state == 0 && connection.pending_remote_offer_sdp == null;
+              var sctp_not_up = connection.pc.sctp == null || connection.pc.sctp.state !== "connected";
+              var need_dc = sctp_not_up && connection.list_data_channels.length == 0 && connection.negotiation_state == 0 && connection.pending_remote_offer_sdp == null;
               if (need_dc) {
                 create_data_channel();
-              } else if (connection.pc.sctp == null && connection.list_data_channels.length == 0) {
+              } else if (sctp_not_up && connection.list_data_channels.length == 0) {
                 connection.create_data_channel_timer = setTimeout(try_create_dc, 100);
               }
             }
