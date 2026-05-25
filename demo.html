@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>StableWebRTC — Inspector</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap');
+  :root{
+    --bg:#080a0e;--s1:#0e1118;--s2:#151a24;
+    --b:#262d3d;
+    --t:#c4c9d6;--dim:#525a72;--white:#edf0f7;
+    --ok:#2cd49a;--err:#e84e4e;--warn:#e8a020;--info:#4c84ec;
+    --accent:#7868e8;--accent2:#a490f8;
+    --pA:#44c8a0;--pABg:#44c8a008;--pABd:#44c8a025;
+    --pB:#4890e8;--pBBg:#4890e808;--pBBd:#4890e825;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--t);font-size:13px}
+  header{display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid var(--b);background:var(--s1);position:sticky;top:0;z-index:10}
+  header h1{font-family:'IBM Plex Mono',monospace;font-size:.88rem;color:var(--white);font-weight:600}
+  header .sub{font-size:.68rem;color:var(--dim);margin-right:auto}
+  .pill{font-family:'IBM Plex Mono',monospace;font-size:.58rem;padding:3px 10px;border-radius:14px;border:1px solid var(--b);display:inline-flex;align-items:center;gap:5px}
+  .pill::before{content:'';width:5px;height:5px;border-radius:50%}
+  .pill.on{border-color:var(--ok);color:var(--ok)}.pill.on::before{background:var(--ok)}
+  .pill.off{border-color:var(--err);color:var(--err)}.pill.off::before{background:var(--err)}
+  .pill.wait{border-color:var(--warn);color:var(--warn)}.pill.wait::before{background:var(--warn);animation:bk 1s infinite}
+  @keyframes bk{0%,100%{opacity:1}50%{opacity:.25}}
+  button{font-family:'IBM Plex Mono',monospace;font-size:.58rem;padding:4px 9px;border:1px solid var(--b);border-radius:4px;background:var(--s2);color:var(--t);cursor:pointer;transition:.1s}
+  button:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .btn-ok{border-color:var(--ok);color:var(--ok)}.btn-ok:hover{background:var(--ok);color:#000}
+  .btn-w{border-color:#e8a02044;color:var(--warn)}.btn-w:hover{background:var(--warn);color:#000}
+  .btn-e{border-color:#e84e4e44;color:var(--err)}.btn-e:hover{background:var(--err);color:#fff}
+  input[type=text]{font-family:'IBM Plex Mono',monospace;font-size:.58rem;padding:4px 7px;border:1px solid var(--b);border-radius:4px;background:var(--s2);color:var(--white);outline:none;width:90px}
+  input:focus{border-color:var(--accent)}
+  .sw{display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:.5rem;color:var(--dim);user-select:none;padding:2px 5px;border:1px solid var(--b);border-radius:4px;transition:.1s}
+  .sw.on{border-color:var(--ok);color:var(--ok);background:#2cd49a10}
+  .sw .dot{width:6px;height:6px;border-radius:50%;background:#444;transition:.1s}.sw.on .dot{background:var(--ok)}
+  label.tg{font-family:'IBM Plex Mono',monospace;font-size:.55rem;padding:3px 7px;border:1px solid var(--b);border-radius:4px;cursor:pointer;user-select:none;color:var(--dim);transition:.1s}
+  label.tg input{display:none}
+  label.tg.on{border-color:var(--ok);color:var(--ok);background:#2cd49a14}
+  .gbar{display:flex;gap:5px;flex-wrap:wrap;padding:7px 20px;border-bottom:1px solid var(--b);background:var(--s1);align-items:center;position:sticky;top:42px;z-index:9}
+  .gbar .lb{font-size:.55rem;color:var(--dim);font-family:'IBM Plex Mono',monospace}
+  .gbar .sep{width:1px;height:16px;background:var(--b);margin:0 4px}
+  .cols{display:grid;grid-template-columns:1fr 1fr}
+  @media(max-width:900px){.cols{grid-template-columns:1fr}}
+  .col{padding:12px;display:flex;flex-direction:column;gap:10px;border-right:1px solid var(--b)}
+  .col:last-child{border-right:none}
+  .col.a{background:var(--pABg)}.col.b{background:var(--pBBg)}
+  .pnl{background:var(--s1);border:1px solid var(--b);border-radius:6px;overflow:hidden}
+  .ph{font-family:'IBM Plex Mono',monospace;font-size:.6rem;font-weight:600;padding:7px 10px;border-bottom:1px solid var(--b);display:flex;align-items:center;gap:6px}
+  .ph.ha{color:var(--pA);border-left:2px solid var(--pA)}.ph.hb{color:var(--pB);border-left:2px solid var(--pB)}
+  .ph .r{margin-left:auto;display:flex;gap:3px}
+  .pbody{padding:8px 10px}
+  .ir{display:flex;justify-content:space-between;padding:2px 0;font-size:.64rem}
+  .ir .k{color:var(--dim)}.ir .v{font-family:'IBM Plex Mono',monospace;font-size:.59rem;font-weight:500}
+  .v-ok{color:var(--ok)}.v-err{color:var(--err)}.v-w{color:var(--warn)}.v-i{color:var(--info)}
+  .sec-h{font-family:'IBM Plex Mono',monospace;font-size:.55rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:4px 0;display:flex;align-items:center;gap:5px;color:var(--dim)}
+  .sec-h.send{color:var(--ok)}.sec-h.send::before{content:'▲';font-size:.45rem}
+  .sec-h.recv{color:var(--info)}.sec-h.recv::before{content:'▼';font-size:.45rem}
+  .abar{display:flex;align-items:center;gap:4px;padding:6px 10px;background:var(--s1);border:1px solid var(--b);border-radius:6px;flex-wrap:wrap}
+  .abar .lb{font-size:.55rem;color:var(--dim);font-family:'IBM Plex Mono',monospace}
+  .sc{background:var(--s1);border:1px solid var(--b);border-radius:6px;overflow:hidden;transition:opacity .2s}
+  .sc.dead{opacity:.3}
+  .sc-top{display:flex;align-items:center;gap:5px;padding:4px 8px;border-bottom:1px solid var(--b);font-family:'IBM Plex Mono',monospace;font-size:.56rem}
+  .tid{font-weight:600;padding:1px 5px;border-radius:3px;font-size:.54rem}
+  .tid.a{background:var(--pABd);color:var(--pA)}.tid.b{background:var(--pBBd);color:var(--pB)}
+  .sc-top .dir{font-size:.46rem;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+  .sc-top .ctrls{margin-left:auto;display:flex;gap:3px;align-items:center}
+  .sc-vid{background:#000;width:100%;position:relative}
+  .sc-vid video{width:100%;display:block}
+  .sc-vid .novid{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:.5rem;color:#333;font-family:'IBM Plex Mono',monospace}
+  .sc-stats{padding:4px 8px;display:flex;flex-direction:column;gap:1px}
+  .sc-sr{display:flex;align-items:center;gap:5px;font-size:.52rem;font-family:'IBM Plex Mono',monospace;color:var(--dim);flex-wrap:wrap;min-height:14px}
+  .sc-sr .lb{font-weight:600;color:var(--t);font-size:.5rem;min-width:28px}
+  .sc-sr b{color:var(--white);font-weight:500}
+  .dot-s{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+  .dot-s.on{background:var(--ok)}.dot-s.off{background:#444}
+  .loss{color:var(--err)!important}
+  .sc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:8px}
+  .empty-m{font-size:.58rem;color:var(--dim);font-style:italic;padding:4px 0}
+  .log-area{border-top:1px solid var(--b);background:var(--s1)}
+  .log-h{font-family:'IBM Plex Mono',monospace;font-size:.58rem;padding:5px 20px;border-bottom:1px solid var(--b);display:flex;align-items:center;color:var(--dim)}
+  .log-h button{margin-left:auto}
+  .logb{font-family:'IBM Plex Mono',monospace;font-size:.52rem;line-height:1.6;padding:5px 20px;max-height:160px;overflow-y:auto;white-space:pre-wrap;color:var(--dim)}
+  .logb .e{color:var(--err)}.logb .o{color:var(--ok)}.logb .i{color:var(--info)}.logb .w{color:var(--warn)}.logb .a{color:var(--accent2)}
+</style>
+</head>
+<body>
+<header>
+  <h1>📡 StableWebRTC Inspector</h1>
+  <span class="sub">Event-driven diagnostics</span>
+  <div class="pill off" id="pill">disconnected</div>
+</header>
+<div class="gbar">
+  <span class="lb">Session:</span>
+  <button class="btn-ok" id="btnConnect">Connect</button>
+  <button class="btn-e" id="btnDestroy">Destroy</button>
+  <div class="sep"></div>
+  <span class="lb">Simulate:</span>
+  <button class="btn-w" id="btnCut">Network Cut</button>
+  <button class="btn-ok" id="btnRestore">Restore</button>
+  <button class="btn-w" id="btnBl">Block Signals</button>
+  <button class="btn-ok" id="btnUn">Unblock</button>
+</div>
+<div class="cols">
+  <div class="col a" id="colA"></div>
+  <div class="col b" id="colB"></div>
+</div>
+<div class="log-area">
+  <div class="log-h">Log <button id="btnCl">Clear</button></div>
+  <div class="logb" id="log"></div>
+</div>
+
+<script src="dist/stable-webrtc.browser.js"></script>
+<script>
+(function(){
+'use strict';
+
+var logEl=document.getElementById('log');
+function log(m,c){var s=document.createElement('span');s.className=c||'';s.textContent='['+new Date().toISOString().slice(11,23)+'] '+m+'\n';logEl.appendChild(s);logEl.scrollTop=logEl.scrollHeight;}
+document.getElementById('btnCl').onclick=function(){logEl.innerHTML='';};
+
+function mkVid(label){
+  var c=document.createElement('canvas');c.width=160;c.height=90;var ctx=c.getContext('2d'),n=0;
+  setInterval(function(){var h=(n*2)%360;ctx.fillStyle='hsl('+h+',45%,16%)';ctx.fillRect(0,0,160,90);ctx.strokeStyle='hsla('+h+',50%,40%,.08)';for(var x=0;x<160;x+=16){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,90);ctx.stroke();}for(var y=0;y<90;y+=16){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(160,y);ctx.stroke();}ctx.fillStyle='#fffa';ctx.font='600 9px IBM Plex Mono,monospace';ctx.fillText(label,4,12);n++;},100);
+  return c.captureStream(10).getVideoTracks()[0];
+}
+function mkAud(){try{var a=new(window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator();var g=a.createGain();o.frequency.value=220;g.gain.value=0.01;var d=a.createMediaStreamDestination();o.connect(g);g.connect(d);o.start();return d.stream.getAudioTracks()[0];}catch(e){return null;}}
+
+var blocked=false;
+var bus={L:{},on:function(s,f){(this.L[s]=this.L[s]||[]).push(f);},send:function(to,m){if(blocked)return;var c=m,l=this.L[to];setTimeout(function(){if(l)l.forEach(function(f){try{f(c)}catch(e){}});},0);}};
+var P={A:null,B:null},UI={A:null,B:null},fakeIce=[];
+
+/* ══════ Switch ══════ */
+function Switch(label,initial,onChange){
+  this.el=document.createElement('div');this.el.className='sw'+(initial?' on':'');
+  this.el.innerHTML='<div class="dot"></div>'+label;this._on=!!initial;this._sup=false;
+  var self=this;
+  this.el.onclick=function(){self._on=!self._on;self.el.classList.toggle('on',self._on);if(!self._sup&&onChange)onChange(self._on);};
+  this.set=function(v){if(self._on===v)return;self._sup=true;self._on=v;self.el.classList.toggle('on',v);self._sup=false;};
+}
+
+/* ══════ PeerUI ══════ */
+function PeerUI(name,col,peer){
+  var self=this;this.name=name;this.col=col;this.peer=peer;
+  this.hcls=name==='A'?'ha':'hb';this.tcls=name==='A'?'a':'b';this.cards={};
+
+  // Connection panel
+  var ci=mk('div','pnl');var ciH=mk('div','ph '+this.hcls);ciH.textContent='Peer '+name+' — Connection';
+  var ciR=mk('span','r');
+  var iceBtn=document.createElement('button');iceBtn.className='btn-w';iceBtn.textContent='ICE Restart';iceBtn.style.cssText='font-size:.5rem;padding:2px 6px';
+  iceBtn.onclick=function(){self.peer.restartIce();log(name+' manual ICE restart','w');};
+  ciR.appendChild(iceBtn);ciH.appendChild(ciR);ci.appendChild(ciH);
+  this.ciBody=mk('div','pbody');ci.appendChild(this.ciBody);col.appendChild(ci);
+
+  // State panel
+  var st=mk('div','pnl');st.innerHTML='<div class="ph '+this.hcls+'">Peer '+name+' — State & DC</div>';
+  this.stBody=mk('div','pbody');st.appendChild(this.stBody);col.appendChild(st);
+
+  // Add stream bar
+  var ab=mk('div','abar');ab.innerHTML='<span class="lb">Tag:</span>';
+  this.tagIn=document.createElement('input');this.tagIn.type='text';this.tagIn.placeholder='stream-name';ab.appendChild(this.tagIn);
+  this.vidTog=mkTog('Video',true);ab.appendChild(this.vidTog.el);
+  this.audTog=mkTog('Audio',true);ab.appendChild(this.audTog.el);
+  var addBtn=document.createElement('button');addBtn.className='btn-ok';addBtn.textContent='+ Add';
+  addBtn.onclick=function(){self.addStream();};ab.appendChild(addBtn);col.appendChild(ab);
+
+  col.appendChild(mkEl('div','sec-h send','Sending'));
+  this.sendGrid=mk('div','sc-grid');col.appendChild(this.sendGrid);
+  this.sendEmpty=mkEl('div','empty-m','No outgoing streams');col.appendChild(this.sendEmpty);
+  col.appendChild(mkEl('div','sec-h recv','Receiving'));
+  this.recvGrid=mk('div','sc-grid');col.appendChild(this.recvGrid);
+  this.recvEmpty=mkEl('div','empty-m','No incoming streams');col.appendChild(this.recvEmpty);
+
+  // ── Wire events (no polling!) ──
+  this._localFP=null;this._remoteFP=null;
+  this._handlers={
+    statechange: function(){ self.updateCI(); self.updateST(); self.syncCards(); updatePill(); },
+    log:         function(m){ log(name+' '+m, /payload: (DIFF|DIFF_DEFLATE)/.test(m) ? 'a' : 'i'); },
+    stream:      function(ms,info){ log(name+' recv "'+info.tag_id+'" v='+(info.video_track?'y':'n')+' a='+(info.audio_track?'y':'n'),'o'); self.syncCards(); },
+    streamstats: function(){ self.syncCards(); },
+    connect:     function(){ log(name+' DC OPEN','o'); updatePill(); },
+    close:       function(){ log(name+' CLOSED','e'); updatePill(); },
+    error:       function(e){ log(name+' err: '+(e&&e.message?e.message:e),'e'); },
+    disconnect:  function(o){ log(name+' DISCONNECT '+o.reason+' ('+o.restartCount+')','w'); },
+    reconnect:   function(){ log(name+' RECONNECTED','o'); },
+    connectioninfo: function(i){ log(name+' conninfo '+i.type+' rtt='+(i.rtt!=null?i.rtt.toFixed(1)+'ms':'?'),'a'); },
+    fingerprints: function(local,remote){
+      self._localFP=local;self._remoteFP=remote;
+      log(name+' fingerprints available','a');self.updateCI();
+    },
+  };
+  for(var ev in this._handlers) peer.on(ev, this._handlers[ev]);
+
+  // Initial render
+  this.updateCI(); this.updateST();
+}
+
+PeerUI.prototype.addStream=function(){
+  var self=this;
+  var tag=(this.tagIn.value||'').trim()||('s'+Math.floor(Math.random()*9000+1000));
+  var opts={};
+  if(this.vidTog.on())opts.video_track=mkVid(this.name+':'+tag);
+  if(this.audTog.on()){var at=mkAud();if(at)opts.audio_track=at;}
+  if(!opts.video_track&&!opts.audio_track){log('Select video or audio','w');return;}
+  this.peer.stream(tag,opts);log(this.name+' + "'+tag+'"','i');this.tagIn.value='';
+  // Immediate sync for sending cards (replaceTrack path has no statechange)
+  setTimeout(function(){ self.syncCards(); },50);
+};
+
+PeerUI.prototype.updateCI=function(){this.ciBody.innerHTML=ciHTML(this.peer.connection,this._localFP,this._remoteFP);};
+PeerUI.prototype.updateST=function(){this.stBody.innerHTML=stHTML(this.peer.connection);};
+
+PeerUI.prototype.syncCards=function(){
+  var p=this.peer;
+  syncDir(p,'sending',this.sendGrid,this.sendEmpty,this.cards,'s:',this.name,this.tcls);
+  syncDir(p,'receiving',this.recvGrid,this.recvEmpty,this.cards,'r:',this.name,this.tcls);
+};
+
+PeerUI.prototype.destroy=function(){
+  // Unsubscribe all events
+  for(var ev in this._handlers) this.peer.off(ev, this._handlers[ev]);
+  for(var k in this.cards){if(this.cards[k].el.parentNode)this.cards[k].el.parentNode.removeChild(this.cards[k].el);}
+  this.cards={};this.col.innerHTML='';
+};
+
+/* ══════ Card sync ══════ */
+function syncDir(peer,dir,grid,emptyEl,cards,pfx,pn,tcls){
+  var streams=peer.getStreams(dir);var tags=Object.keys(streams);
+  emptyEl.style.display=tags.length?'none':'';
+  var isSend=(dir==='sending'),active={};
+  for(var i=0;i<tags.length;i++){
+    var tag=tags[i],key=pfx+tag;active[key]=true;
+    var s=isSend?streams[tag].sending:streams[tag].receiving;
+    if(!cards[key])cards[key]=buildCard(tag,isSend?'send':'recv',grid,pn,tcls);
+    refreshCard(cards[key],s,isSend);
+  }
+  for(var k in cards){if(k.charAt(0)===pfx.charAt(0)&&!active[k]){if(cards[k].el.parentNode)cards[k].el.parentNode.removeChild(cards[k].el);delete cards[k];}}
+}
+
+function buildCard(tag,dir,container,pn,tcls){
+  var card=mk('div','sc');var top=mk('div','sc-top');
+  top.appendChild(mkEl('span','tid '+tcls,tag));
+  top.appendChild(mkEl('span','dir',dir));
+  var vidSw=null,audSw=null;
+  if(dir==='send'){
+    var ctrls=mk('span','ctrls');
+    vidSw=new Switch('V',true,function(on){var p=P[pn];if(!p)return;if(on){p.stream(tag,{video_track:mkVid(pn+':'+tag)});}else{p.stream(tag,{video_track:null});}log(pn+' video '+(on?'ON':'OFF')+' "'+tag+'"','i');if(UI[pn])setTimeout(function(){UI[pn].syncCards();},50);});
+    audSw=new Switch('A',true,function(on){var p=P[pn];if(!p)return;if(on){var at=mkAud();if(at)p.stream(tag,{audio_track:at});}else{p.stream(tag,{audio_track:null});}log(pn+' audio '+(on?'ON':'OFF')+' "'+tag+'"','i');if(UI[pn])setTimeout(function(){UI[pn].syncCards();},50);});
+    ctrls.appendChild(vidSw.el);ctrls.appendChild(audSw.el);
+    var rb=document.createElement('button');rb.textContent='↻';rb.style.cssText='font-size:.48rem;padding:2px 5px';
+    rb.onclick=function(){var p=P[pn];if(p){p.stream(tag,{video_track:mkVid(pn+':'+tag+'-v2')});log(pn+' ↻ "'+tag+'"','i');if(UI[pn])setTimeout(function(){UI[pn].syncCards();},50);}};ctrls.appendChild(rb);
+    var xb=document.createElement('button');xb.textContent='✕';xb.className='btn-e';xb.style.cssText='font-size:.48rem;padding:2px 5px';
+    xb.onclick=function(){var p=P[pn];if(p){p.stream(tag,{video_track:null,audio_track:null});log(pn+' ✕ "'+tag+'"','i');if(UI[pn])setTimeout(function(){UI[pn].syncCards();},50);}};ctrls.appendChild(xb);
+    top.appendChild(ctrls);
+  }
+  card.appendChild(top);
+  var vw=mk('div','sc-vid');var vid=document.createElement('video');vid.autoplay=true;vid.playsInline=true;vid.muted=true;
+  var nv=mkEl('div','novid','no video');vw.appendChild(vid);vw.appendChild(nv);card.appendChild(vw);
+  var st=mk('div','sc-stats');var vr=mk('div','sc-sr');var ar=mk('div','sc-sr');var mr=mk('div','sc-sr');
+  st.appendChild(vr);st.appendChild(ar);st.appendChild(mr);card.appendChild(st);
+  container.appendChild(card);
+  return {el:card,vid:vid,novid:nv,vr:vr,ar:ar,mr:mr,vidSw:vidSw,audSw:audSw,lastTrack:null};
+}
+
+function refreshCard(c,s,isSend){
+  var hasVid=s&&s.video_track;
+  var hasAud=s&&!!s.audio_track;
+  var hasAnyMid=s&&(s.video_mid!=null||s.audio_mid!=null);
+  c.el.classList.toggle('dead',!hasVid&&!hasAud&&!hasAnyMid);
+  c.novid.style.display=hasVid?'none':'';
+  c.novid.textContent=hasAud?'audio only':'no video';
+  if(c.vidSw)c.vidSw.set(!!s&&!!s.video_track);
+  if(c.audSw)c.audSw.set(!!s&&!!s.audio_track);
+  if(hasVid){if(c.lastTrack!==s.video_track){var ms=new MediaStream();ms.addTrack(s.video_track);c.vid.srcObject=ms;c.lastTrack=s.video_track;}}
+  else{if(c.vid.srcObject){c.vid.srcObject=null;c.lastTrack=null;}}
+
+  var v=s&&s.video?s.video:null;var vOn=v&&(v.active||v.fps>0||v.bitrate>0);
+  c.vr.innerHTML='<span class="lb">VID</span><div class="dot-s '+(vOn?'on':'off')+'"></div>'+
+    m(v&&v.width,v?v.width+'×'+v.height:0)+m(v&&v.fps,v?v.fps+'fps':0)+
+    m(v&&v.bitrate,v?fmtB(v.bitrate):0)+m(v&&v.codec,(v&&v.codec)?v.codec.replace('video/',''):0)+
+    (!isSend?m(1,'loss '+(v&&v.packetLoss?v.packetLoss.toFixed(1)+'%':'—'),v&&v.packetLoss>0)+m(1,'jit '+(v&&v.jitter?(v.jitter*1000).toFixed(1)+'ms':'—')):'');
+
+  var a=s&&s.audio?s.audio:null;var aOn=a&&(a.active||a.bitrate>0);
+  c.ar.innerHTML='<span class="lb">AUD</span><div class="dot-s '+(aOn?'on':'off')+'"></div>'+
+    m(a&&a.codec,(a&&a.codec)?a.codec.replace('audio/',''):0)+m(a&&a.bitrate,a?fmtB(a.bitrate):0)+
+    (!isSend?m(1,'loss '+(a&&a.packetLoss?a.packetLoss.toFixed(1)+'%':'—'),a&&a.packetLoss>0):'');
+
+  c.mr.innerHTML='<span class="lb">MID</span><span>v:'+(s&&s.video_mid!=null?s.video_mid:'—')+' a:'+(s&&s.audio_mid!=null?s.audio_mid:'—')+'</span>';
+}
+function m(cond,val,isLoss){if(!cond)return '<span>—</span>';return '<span'+(isLoss?' class="loss"':'')+'>'+((typeof val==='number'&&!val)?'—':'<b>'+val+'</b>')+'</span>';}
+
+/* ══════ Info HTML builders ══════ */
+function fpHex(u8){if(!u8)return '—';var h='';for(var i=0;i<u8.length;i++){if(i)h+=':';var b=u8[i].toString(16).toUpperCase();if(b.length<2)b='0'+b;h+=b;}if(u8.length>6){var parts=h.split(':');return parts.slice(0,3).join(':')+' … '+parts.slice(-3).join(':');}return h;}
+
+function ciHTML(c,localFP,remoteFP){
+  var D='—';if(!c||!c.pc)return ir('Type',D,'')+ir('RTT',D,'')+ir('BW ↑',D,'')+ir('NAT',D,'')+ir('UDP',D,'')+ir('Local',D,'')+ir('Remote',D,'')+ir('Relay',D,'')+ir('Signal via',D,'')+ir('Uptime',D,'')+ir('Local FP',D,'')+ir('Remote FP',D,'');
+  var ct=c.current_connection_type||'unknown';
+  var sig=(c.data_channel_state==='open')?'DataChannel':'external';
+  var up=D;if(c.data_channel_connect_time){var sec=Math.floor((Date.now()-c.data_channel_connect_time)/1000);up=sec>=60?Math.floor(sec/60)+'m '+sec%60+'s':sec+'s';}
+  return ir('Type',ct,ct.indexOf('direct')===0?'v-ok':ct==='relayed'?'v-w':'')+
+    ir('RTT',c.current_rtt!=null?c.current_rtt.toFixed(1)+' ms':D,'v-i')+
+    ir('BW ↑',c.current_bandwidth_outgoing!=null?fmtB(c.current_bandwidth_outgoing):D,'v-i')+
+    ir('NAT',c.local_symmetric_nat===true?'symmetric':(c.local_symmetric_nat===false?'ok':D),c.local_symmetric_nat===true?'v-w':(c.local_symmetric_nat===false?'v-ok':''))+
+    ir('UDP',c.local_support_udp===true?'yes':(c.local_support_udp===false?'no':D),c.local_support_udp===false?'v-w':(c.local_support_udp===true?'v-ok':''))+
+    ir('Local',fmtEP(c.current_local_ip,c.current_local_port,c.current_local_protocol,c.current_local_candidate_type),'')+
+    ir('Remote',fmtEP(c.current_remote_ip,c.current_remote_port,c.current_remote_protocol,c.current_remote_candidate_type),'')+
+    ir('Relay','L:'+(c.current_local_relay!=null?(c.current_local_relay?'yes':'no'):D)+' R:'+(c.current_remote_relay!=null?(c.current_remote_relay?'yes':'no'):D),c.current_local_relay||c.current_remote_relay?'v-w':'v-ok')+
+    ir('Signal via',sig,sig==='DataChannel'?'v-ok':'v-w')+ir('Uptime',up,'v-i')+
+    ir('Local FP',fpHex(localFP),localFP?'v-ok':'')+ir('Remote FP',fpHex(remoteFP),remoteFP?'v-ok':'');
+}
+function stHTML(c){
+  var D='—';if(!c)return ir('Negotiation',D,'')+ir('Signaling',D,'')+ir('DataChannel',D,'')+ir('ICE',D,'')+ir('Connection',D,'')+ir('Gathering',D,'')+ir('DTLS',D,'')+ir('SCTP',D,'')+ir('Restarts',D,'')+ir('Gather retry',D,'')+ir('Epoch',D,'')+ir('DC queue',D,'')+ir('DC buffer',D,'')+ir('DC send',D,'')+ir('DC recv',D,'');
+  var h=ir('Negotiation',sb(String(c.negotiation_state),['0'],['1','2','3','4','5']))+
+    ir('Signaling',sb(c.signaling_state,['stable'],['have-local-offer','have-remote-offer']))+
+    ir('DataChannel',sb(c.data_channel_state,['open'],['connecting']));
+  h+=c.pc?ir('ICE',sb(c.pc.iceConnectionState,['connected','completed'],['checking','disconnected']))+ir('Connection',sb(c.pc.connectionState,['connected'],['connecting','disconnected']))+ir('Gathering',sb(c.pc.iceGatheringState,['complete'],['gathering'])):ir('ICE',D,'')+ir('Connection',D,'')+ir('Gathering',D,'');
+  h+=ir('DTLS',sb(c.sctp_dtls_state,['connected'],['connecting','new']))+ir('SCTP',sb(c.sctp_state,['connected'],['connecting','new']));
+  h+=ir('Restarts',String(c.ice_restart_count),c.ice_restart_count>0?'v-w':'')+ir('Gather retry',String(c.gathering_retry_count),c.gathering_retry_count>0?'v-w':'')+ir('Epoch',String(c.epoch_negotiation_success),'');
+  var q=c.data_channel_sending_messages_queue?c.data_channel_sending_messages_queue.length:0;
+  h+=ir('DC queue',String(q),q>50?'v-err':q>10?'v-w':'');
+  var bf=D;if(c.data_channel_primary_index!=null&&c.list_data_channels[c.data_channel_primary_index]){var ba=c.list_data_channels[c.data_channel_primary_index].bufferedAmount||0;bf=ba>=1024?(ba/1024).toFixed(1)+' KB':ba+' B';}
+  h+=ir('DC buffer',bf,'');
+  var now=Date.now(),cut=now-1000,sB=0,sN=0,rB=0,rN=0;
+  if(c.data_channel_sent_events)for(var i=c.data_channel_sent_events.length-1;i>=0;i--){if(c.data_channel_sent_events[i][0]<cut)break;sB+=c.data_channel_sent_events[i][1];sN++;}
+  if(c.data_channel_recv_events)for(var i=c.data_channel_recv_events.length-1;i>=0;i--){if(c.data_channel_recv_events[i][0]<cut)break;rB+=c.data_channel_recv_events[i][1];rN++;}
+  h+=ir('DC send',sN?sN+'/s · '+fmtBytes(sB)+'/s':D,'')+ir('DC recv',rN?rN+'/s · '+fmtBytes(rB)+'/s':D,'');
+  return h;
+}
+
+/* ══════ Pill ══════ */
+function updatePill(){
+  var pl=document.getElementById('pill');
+  if(!P.A){pl.className='pill off';pl.textContent='disconnected';}
+  else if(P.A.connected&&P.B&&P.B.connected){pl.className='pill on';pl.textContent='connected';}
+  else{pl.className='pill wait';pl.textContent='connecting…';}
+}
+
+/* ══════ Helpers ══════ */
+function mk(t,c){var e=document.createElement(t);if(c)e.className=c;return e;}
+function mkEl(t,c,txt){var e=mk(t,c);e.textContent=txt;return e;}
+function mkTog(t,init){var lb=mk('label','tg'+(init?' on':''));var cb=document.createElement('input');cb.type='checkbox';cb.checked=!!init;lb.appendChild(cb);lb.appendChild(document.createTextNode(t));cb.onchange=function(){lb.classList.toggle('on',cb.checked);};return{el:lb,on:function(){return cb.checked;}};}
+function ir(k,v,cls){var vc=(typeof v==='string'&&v.indexOf('<')===0)?v:'<span class="v '+(cls||'')+'">'+v+'</span>';return '<div class="ir"><span class="k">'+k+'</span>'+vc+'</div>';}
+function sb(v,ok,warn){var c='v-err';if(ok&&ok.indexOf(v)>=0)c='v-ok';else if(warn&&warn.indexOf(v)>=0)c='v-w';return '<span class="v '+c+'">'+v+'</span>';}
+function fmtB(b){if(b>=1e6)return(b/1e6).toFixed(1)+' Mbps';if(b>=1e3)return(b/1e3).toFixed(0)+' kbps';return b+' bps';}
+function fmtBytes(b){if(b>=1048576)return(b/1048576).toFixed(1)+' MB';if(b>=1024)return(b/1024).toFixed(1)+' KB';return b+' B';}
+function fmtEP(ip,port,proto,ct){if(!ip&&!port)return '—';return(ct||'')+' '+(ip||'?')+':'+(port||'?')+' '+((proto||'').toUpperCase());}
+
+/* ══════ Init ══════ */
+function init(){
+  if(P.A)return;P.A=new StableWebRTC();P.B=new StableWebRTC();bus.L={};
+  bus.on('A',function(s){try{P.A.signal(s)}catch(e){}});bus.on('B',function(s){try{P.B.signal(s)}catch(e){}});
+  P.A.on('signal',function(s){bus.send('B',s)});P.B.on('signal',function(s){bus.send('A',s)});
+
+  // Build UI — event handlers are wired inside PeerUI constructor
+  UI.A=new PeerUI('A',document.getElementById('colA'),P.A);
+  UI.B=new PeerUI('B',document.getElementById('colB'),P.B);
+  log('Peers created — connecting','i');
+  updatePill();
+}
+
+/* ══════ Global buttons ══════ */
+document.getElementById('btnConnect').onclick=init;
+document.getElementById('btnDestroy').onclick=function(){
+  blocked=false;fakeIce=[];
+  if(UI.A){UI.A.destroy();UI.A=null;}if(UI.B){UI.B.destroy();UI.B=null;}
+  if(P.A)try{P.A.close()}catch(e){}if(P.B)try{P.B.close()}catch(e){}
+  P={A:null,B:null};bus.L={};updatePill();log('Destroyed','e');
+};
+document.getElementById('btnCut').onclick=function(){
+  if(!P.A||!P.B||!P.A.connection.pc||!P.B.connection.pc){log('Connect first','w');return;}
+  blocked=true;fakeIce=[];
+  [P.A,P.B].forEach(function(p){var pc=p.connection.pc;if(pc){Object.defineProperty(pc,'iceConnectionState',{value:'disconnected',writable:true,configurable:true});fakeIce.push(pc);if(typeof pc.oniceconnectionstatechange==='function')pc.oniceconnectionstatechange();}});
+  log('━ NETWORK CUT ━','w');
+};
+document.getElementById('btnRestore').onclick=function(){blocked=false;fakeIce.forEach(function(pc){try{delete pc.iceConnectionState;}catch(e){}if(typeof pc.oniceconnectionstatechange==='function')try{pc.oniceconnectionstatechange();}catch(e){}});fakeIce=[];log('━ NETWORK RESTORED ━','o');};
+document.getElementById('btnBl').onclick=function(){blocked=true;log('Signals blocked','w');};
+document.getElementById('btnUn').onclick=function(){blocked=false;log('Signals unblocked','o');};
+})();
+</script>
+</body>
+</html>

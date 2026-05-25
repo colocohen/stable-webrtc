@@ -5,496 +5,603 @@
 <h1 align="center">StableWebRTC</h1>
 
 <p align="center">
-  <strong>A production-grade WebRTC library for Node.js & Browsers</strong>
+  <strong>Production-grade WebRTC for Node.js &amp; Browsers</strong>
 </p>
 
 <p align="center">
-  <code>stable-webrtc</code> is a JavaScript library built from the ground up to solve the hardest real-world issues developers face with WebRTC: glare, renegotiation loops, out-of-order signaling, flaky NATs, and oversized or slow SDPs.  
-  With a clean API and a battle-tested core, you can ship video & data apps quickly and reliably.
+  WebRTC connections that survive the real world — glare, network chaos, oversized SDPs, and all.
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/stable-webrtc">
-    <img src="https://img.shields.io/npm/v/stable-webrtc?color=blue" alt="npm version">
-  </a>
-  <img src="https://img.shields.io/badge/status-in%20development-yellow" alt="status">
+  <a href="https://www.npmjs.com/package/stable-webrtc"><img src="https://img.shields.io/npm/v/stable-webrtc?color=blue" alt="npm version"></a>
   <img src="https://img.shields.io/github/license/colocohen/stable-webrtc?color=brightgreen" alt="license">
 </p>
 
 ---
 
-## 📑 Table of Contents
-- [🔍 Why StableWebRTC?](#-why-stablewebrtc)
-- [🌟 Features](#-features)
-- [⚙️ Installation](#️-installation)
-- [📘 API](#-api)
-- [🚀 Usage Examples](#-usage-examples)
-- [🔒 Security](#-security)
-- [🧪 Troubleshooting & FAQ](#-troubleshooting--faq)
-- [💡 Support](#-support)
-- [📜 License](#-license)
+## The Problem
+
+A WebRTC demo connects two browsers in 20 lines. A WebRTC *product* fights these battles daily:
+
+| Issue | What happens | How often |
+|-------|-------------|-----------|
+| **Glare** | Both peers send an offer at the same time. The native API deadlocks. | Every call with camera + screenshare |
+| **Signal reordering** | An ICE candidate arrives before the offer it belongs to. Connection fails silently. | Any non-WebSocket transport |
+| **Renegotiation storms** | User switches camera while a previous negotiation is still in-flight. SDP state corrupts. | Camera/mic toggle, screenshare start/stop |
+| **SDP bloat** | 4KB+ of SDP text fragments across packets, slowing or breaking the handshake. | Simulcast, multiple codecs, many transceivers |
+| **Network roaming** | User walks from Wi-Fi to LTE. ICE candidates expire. Call drops. | Mobile, every day |
+| **No disconnect detection** | The native API gives you `iceConnectionState` and nothing else. No events for "reconnecting" or "recovered". Building a reconnection UI requires polling and guesswork. | Every app with a status indicator |
+| **No stream telemetry** | Want to show bitrate, packet loss, or resolution per stream? You have to poll `getStats()`, parse 30+ report types, compute deltas yourself, and track which stats belong to which stream by MID. | Every app with quality indicators |
+| **DataChannel backpressure** | Burst of messages fills the buffer. App freezes. No error. No warning. | File transfer, game state sync |
+| **Tab backgrounding** | Mobile OS suspends the tab. Timers stop. State goes stale. Peer thinks you left. | Mobile browsers |
+
+`stable-webrtc` handles all of this internally. You get a clean API — the library handles the rest.
 
 ---
 
-## 🔍 Why StableWebRTC?
+## Quick Start
 
-WebRTC is the open standard that powers **real-time communication on the web**.  
-It enables browsers and servers to exchange audio, video, and data directly —  
-allowing use cases such as video calls between two users, live streaming from a browser to a server,  
-low-latency data transfer for multiplayer games, and collaborative apps.  
+```js
+var peer1 = new StableWebRTC();
+var peer2 = new StableWebRTC();
 
-One of the strongest benefits of WebRTC is that it supports **peer-to-peer (P2P) connections**.  
-In most cases, once signaling is complete, traffic flows **directly between browsers** without going through a central media server.  
-This reduces latency, saves enormous amounts of bandwidth, and dramatically lowers the load on your infrastructure.  
-Instead of routing gigabytes of video traffic through your servers, peers exchange it directly — your server only helps them “find” each other.  
+// Relay signaling (in production, use WebSocket / HTTP / MQTT / anything)
+peer1.on('signal', data => peer2.signal(data));
+peer2.on('signal', data => peer1.signal(data));
 
-However, while WebRTC is built into all major browsers and available in Node.js via libraries, the native API is **extremely complex**.  
-Many teams avoid working with it directly and instead rely on third-party SDKs or cloud services,  
-because handling all the edge cases of signaling, renegotiation, and ICE behavior is notoriously error-prone.  
+// Connected — send data
+peer1.on('connect', () => peer1.send('Hello from peer1!'));
+peer2.on('data', msg => console.log('Received:', msg.toString()));
+```
 
-A simple commun demo code often looks effortless:
-> *“Two browsers connected with just a few lines of code!”*  
-
-But once you ship to production, reality sets in:
-
-- **Strict signaling order (fragile in practice)**
-  The native WebRTC API requires signaling messages (offers, answers, ICE candidates) to be delivered in exactly the same order they were generated. In real-world networks, messages are delayed, duplicated, reordered, or dropped entirely. A single ICE candidate arriving too early or too late is enough to break the whole connection.  
-
-- **Crossed contexts**
-  If multiple tabs or concurrent calls share the same signaling socket, messages can leak between sessions. One peer may process data meant for another, corrupting state and poisoning negotiations.  
-
-- **Renegotiation conflicts**
-  In the native API, only one negotiation can be “in flight” at a time. If both peers create an offer simultaneously (glare), or if a user changes devices (camera, microphone, screenshare) while a previous negotiation hasn’t finished, the processes collide. The result is deadlocks, dropped calls, or sessions stuck in an inconsistent state.  
-
-- **Backgrounding & tab suspension**
-  On mobile, backgrounded apps pause timers and radios; on desktop, inactive tabs may be discarded and later revived with stale state. This easily desynchronizes peers and forces reconnections.  
-
-- **Unstable networks**
-  Users roam between Wi-Fi and LTE, some ICE candidates never arrive, and enterprise proxies often force TURN over TCP/TLS. IPv4/IPv6 mismatches add even more instability.  
-
-- **DataChannel congestion**
-  Under light testing, DataChannels seem instant. But during heavy usage (file transfers, bursty updates), the buffer silently fills, causing apps to freeze without clear error signals.  
-
-- **Huge SDP text**
-  Session descriptions often grow huge when multiple codecs, simulcast layers, or transceivers are negotiated. These oversized SDPs exceed MTU limits, fragment across the network, and significantly delay or even prevent the handshake. The outcome: connections that take seconds to establish—or fail altogether.  
-
-
-`stable-webrtc` was designed to *erase these problems*.  
-All the tricky parts — signaling order, renegotiation conflicts, ICE restarts, and SDP bloat — are handled internally.  
-As a developer, you’re left with the **minimum work needed**: create a peer, exchange signaling messages, and send/receive media or data.  
-
-Instead of wrestling with fragile native APIs and dozens of edge cases, you get a clean, predictable foundation that works reliably in production by default.
+That's it. No role assignment, no ICE configuration, no state machine — it just works.
 
 ---
 
-## 🌟 Features
+## What the Native API Gets Wrong
 
-- **Node.js & Browser**\
-  One library, one mental model. Runs in modern browsers and in Node (with a `wrtc` binding) so you can share logic, tests, and monitoring end-to-end.
+The browser's WebRTC API (`RTCPeerConnection`) is a low-level protocol binding, not an application API. Here's what `stable-webrtc` fixes:
 
-- **User-friendly API & Zero-Config Mode**\
-  Sensible defaults for roles, queuing, pacing, compression, and retries. Clear events and explicit lifecycles when you need control—minimal boilerplate when you don’t.
+### Glare is your problem
+The native API gives you `onnegotiationneeded` and expects you to handle the case where both peers send an offer simultaneously. The MDN "perfect negotiation" pattern is 40 lines that doesn't cover all edge cases. `stable-webrtc` uses a 6-state machine with epoch-rotating politeness — one side always yields, and who yields alternates to prevent starvation.
 
-- **Dynamic multi-track media**\
-  Add/remove camera, mic, and screenshare at runtime without tearing the call. The library reuses pre-allocated transceiver slots and stable MID mapping, calling replaceTrack()/setParameters() where possible; renegotiation happens only when required (e.g., new m-section, removing unused-unnecessary slots, or encoding policy change).
+### Rollback is broken across browsers
+`setLocalDescription({type:'rollback'})` behaves differently between Chrome and Firefox. Chrome can corrupt BUNDLE group state during implicit rollback. `stable-webrtc` always uses explicit rollback with a serialized callback queue, ensuring only one rollback is ever in-flight and working around browser-specific bugs.
 
-- **Flexible signaling transport**\
-  Choose any method to carry signaling messages: reliable or unreliable, ordered or unordered (WS, HTTP polling, MQTT, IRC, UDP, custom buses). Signaling is sent as compact binary frames with session/sequence IDs: duplicates are de-duplicated, out-of-order frames are buffered, and large payloads are chunked with checksums and reassembled safely.
+### ICE candidates arrive out of order
+If `addIceCandidate()` is called before `setRemoteDescription()`, it silently fails. `stable-webrtc` queues candidates per-ufrag, sorts by priority, deduplicates, and drains them after the remote description is applied.
 
-- **Smart signaling SDP compression engine**\
-  Compresses SDP offers/answers using [Diff Match Patch](https://github.com/google/diff-match-patch) and/or deflate for smaller SDP payloads and faster signaling, especially across MTU-limited or proxy-heavy paths. Deltas are versioned and integrity-checked, with graceful fallback to full SDP when a compression isn’t applicable.
+### Transceivers fight each other
+If both peers create transceivers simultaneously, m-line ordering in the SDP conflicts. `stable-webrtc` ensures only the offering side creates transceivers (right before `createOffer()`), recycles inactive ones instead of stopping them, and automatically cleans up orphaned transceivers after 1.5 seconds.
 
-- **Signaling via internal DataChannel**\
-  Once a DataChannel is up, signaling seamlessly **moves inside it**, bypassing the signaling server to cut latency; if the channel **drops to disconnected**, routing automatically **falls back** to your external signaling transport.
+### No disconnect/reconnect lifecycle
+The native API gives you raw ICE state strings. Building a "reconnecting..." UI requires polling `iceConnectionState`, debouncing transitions, and guessing. `stable-webrtc` gives you `disconnect` and `reconnect` events with zero configuration.
 
-- **Perfect Negotiation**\
-  A single serialized negotiation queue with glare detection, event coalescing, and automatic rollback—no more negotiation stucks.
+### No per-stream telemetry
+Getting bitrate for a specific video stream requires polling `getStats()`, iterating 30+ report types, matching by MID, computing byte deltas over time, and correlating inbound/outbound reports. `stable-webrtc` does this internally and gives you `streamstats` events with `{ bitrate, fps, packetLoss, jitter, codec }` per tagged stream.
 
-- **Automatic role management**\
-  You never declare “who starts.” Roles are negotiated and locked deterministically to prevent internal glare and race conditions on negotiation process.
+### SDP is absurdly large
+A simple DataChannel-only offer is 2–3KB of text. Adding video makes it 4KB+. `stable-webrtc` compresses the initial offer to ~80 bytes and renegotiation diffs to ~50 bytes using four competing compression strategies. ICE candidates are stripped from SDPs and sent separately as ~20-byte binary packets.
 
-- **Connection health & auto-recovery**\
-  Detects stale or half-open sessions via RTT/loss/ICE state and triggers `restartIce` automatically. Media tracks and DataChannels reattach transparently when possible.
+### No signaling abstraction
+The native API forces you to manually relay offers, answers, and candidates through your own transport. `stable-webrtc` takes binary Uint8Arrays — pipe them through anything (WebSocket, HTTP, MQTT, SMS). After the DataChannel opens, signaling automatically routes through the peer-to-peer connection itself.
 
-- **DataChannel Backpressure & congestion control**\
-  Bounded queues with **dual quotas** (by **messages** and **bytes**), watermark-based pacing, and drain notifications keep DataChannels responsive under bursty load—akin to modern transport flow-control.
+### Host candidates: connectivity vs. privacy, your choice
+By default, host candidates (containing local addresses like `192.168.x.x`) **are** sent — they're what lets two peers on the same machine or LAN find a direct local path, so dropping them silently breaks same-network connections. If you'd rather not expose internal network topology through your signaling relay, set `exclude_host_candidates: true` and only server-reflexive and relay candidates are transmitted. You choose the tradeoff explicitly instead of having connectivity quietly removed.
 
-- **Connection observability**\
-  App-level hooks expose RTT, loss, jitter, bitrate (up/down), selected candidate pair & type (host/srflx/relay), and protocol/family (UDP/TCP, IPv4/IPv6) — plus NAT classification (cone-like / symmetric) inferred from the ICE gathering process, and TURN usage details (whether a relay candidate was required). This raw information can be aggregated by your application to build statistics, for example to track what percentage of users require TURN server.
+### No end-of-candidates signal
+The native API fires `onicecandidate` with `null` when gathering completes, but there's no built-in way to tell the remote peer "I'm done sending candidates." The remote side has to guess using timeouts. `stable-webrtc` sends an explicit candidate count per ufrag, so the receiver knows exactly when all candidates have arrived and signals the ICE agent immediately.
+
+### Certificate generation blocks each connection
+Every `new RTCPeerConnection()` generates a fresh DTLS certificate if you don't provide one. This takes 50–200ms and blocks the constructor. If you're creating multiple connections (mesh network, reconnections), this adds up. `stable-webrtc` pre-generates a shared ECDSA P-256 certificate once and reuses it across all instances, with automatic renewal on expiry.
+
+### Signaling has no integrity protection
+The native API trusts whatever you feed to `setRemoteDescription` and `addIceCandidate`. If your signaling transport corrupts a byte (UDP packet damage, WebSocket frame issue), the connection silently fails with an opaque error. `stable-webrtc` wraps every signaling message in a MurmurHash3 checksum — corrupt messages are dropped before they can poison the state machine. Nonce verification prevents stale or injected signals from being processed.
 
 ---
 
-## ⚙️ Installation
+## Install
 
-#### Node.js (via npm)
-
+**Node.js / bundlers (ESM)**
 ```bash
 npm install stable-webrtc
 ```
+```js
+import StableWebRTC from 'stable-webrtc';
+```
 
-#### Browser (direct script include)
-
-Just copy `stable-webrtc.js` into your project and load it:
-
+**Browser (prebuilt bundle)**
 ```html
-<script src="stable-webrtc.js"></script>
+<script src="dist/stable-webrtc.browser.js"></script>
+<!-- exposes window.StableWebRTC -->
+```
+
+The package ships as ES modules (`src/` split into focused modules; `index.js` is the entry).
+A prebuilt IIFE bundle for direct `<script>` use is produced by `npm run build:browser`.
+
+**Node.js requires a WebRTC binding:**
+```js
+import wrtc from '@roamhq/wrtc';
+const peer = new StableWebRTC({ wrtc: wrtc });
+```
+
+> Dependencies: two tiny zero-dependency libraries — [`compact-delta`](https://www.npmjs.com/package/compact-delta) (SDP delta encoding) and [`litepack`](https://www.npmjs.com/package/litepack) (binary wire schemas).
+
+---
+
+## How It Works
+
+### Nonce-Based Role Resolution
+
+Both peers embed a random nonce in every signaling message. The peer with the higher nonce creates the DataChannel and sends the first offer. The other peer waits. No configuration needed — roles are locked before any SDP is generated, eliminating DataChannel glare and m-line ordering conflicts at the source.
+
+To further reduce glare during startup, each peer waits a random 8–63ms before creating its DataChannel. This staggering ensures that in most cases, only one peer initiates before the nonce exchange resolves who should lead.
+
+### Serialized Negotiation
+
+All negotiations pass through a 6-state machine:
+
+```
+STABLE (0) → MAKING_OFFER (1) → WAITING_FOR_ANSWER (2) → APPLYING_ANSWER (3) → STABLE
+                                                                                    ↑
+STABLE (0) → HANDLING_REMOTE_OFFER (4) → WAITING_FOR_DONE (5) ─────────────────────┘
+```
+
+Only one negotiation can be in-flight at a time. If a new track is added while a negotiation is active, it queues and coalesces. Glare is resolved via epoch-rotating politeness — each successful negotiation flips who yields, preventing starvation.
+
+**Adaptive answer timeout:** When waiting for an answer, the timeout starts at 7 seconds but adjusts based on historical round-trip times. If previous answers took 5 seconds, the timeout extends to match. If no answer arrives in time, the library rolls back and retries automatically.
+
+**Serialized rollback:** Only one rollback can be in-flight at a time. If multiple code paths request a rollback simultaneously (e.g., glare + timeout), they queue and get notified in order when the rollback completes. This prevents Chrome's BUNDLE state corruption that can occur during concurrent rollback attempts.
+
+### SDP Compression Engine
+
+Every offer and answer is compressed through four competing strategies. The smallest payload wins:
+
+| Strategy | Best for | Typical saving |
+|----------|----------|----------------|
+| **Compact** | First offer (DataChannel only) | 70–80% — binary encoding of SDP fields |
+| **Diff** | Renegotiations | 90–97% — only the changed lines |
+| **Deflate** | Large SDPs (simulcast, many codecs) | 50–60% |
+| **Diff + Deflate** | Moderate changes on large SDPs | 85–95% |
+
+Each payload includes a MurmurHash3 checksum. If decompression fails (hash mismatch), the receiver automatically requests a raw retransmit — no manual intervention needed.
+
+**Why this matters:** A typical renegotiation (adding a video track) produces a 3KB SDP. With diff compression, the signaling message is 50–100 bytes — small enough for a single UDP packet, an MQTT message, or even an SMS.
+
+### Trickle-Only ICE
+
+ICE candidates are always stripped from the SDP before `setLocalDescription`. They're sent separately using binary compression (see below). This design choice enables the SDP compression engine to work effectively — embedded candidates add ~1KB of unpredictable text that defeats diff compression.
+
+### Signaling via DataChannel
+
+Once the DataChannel is open, signaling messages (offers, answers, candidates) automatically route through it instead of your external transport. This cuts renegotiation latency to the raw RTT of the peer-to-peer connection. If the DataChannel drops, routing falls back to external signaling transparently.
+
+### Signal Integrity
+
+Every signaling message is wrapped with a MurmurHash3 checksum and the sender's nonce. On receipt:
+- **Checksum mismatch** → message is silently dropped (corrupt or truncated in transit).
+- **Nonce mismatch** → message is silently dropped (prevents signal injection from a third party or a stale connection).
+
+This protects against unreliable transports (UDP, lossy WebSocket) and ensures only the intended peer's messages are processed.
+
+### ICE Candidate Compression
+
+Each ICE candidate is encoded from ~150 bytes of text into ~20–30 bytes of binary using bit-packed fields (transport, type, priority, IP, port, related address). Candidates are deduplicated by ufrag, sorted by priority, and trickled in optimal order.
+
+### Host Candidate Filtering (optional)
+
+By default **all** candidate types — including host candidates (local addresses like `192.168.x.x`) — are sent, because host candidates are what let two peers on the same machine or LAN establish a direct local path. Setting `exclude_host_candidates: true` transmits only server-reflexive (srflx), peer-reflexive (prflx), and relay candidates, preventing local-IP exposure through the signaling channel at the cost of same-network direct connectivity. The default favors connectivity; the option lets privacy-sensitive deployments opt out.
+
+### Signaling Chunking
+
+The library's own signaling (offers, answers, candidates, stream maps) is split into chunks when a message exceeds the per-pipe size limit, then reassembled transparently on the other side — so oversized SDPs (simulcast, many codecs) never exceed a transport's message-size cap. This applies to **both** pipes: the external `signal` transport and the internal DataChannel (SCTP). The limit is `max_signal_chunk_size` (default **1 KB**); the internal pipe uses `min(max_signal_chunk_size, sctp.maxMessageSize)`. Reassembly is all-or-nothing with a lazy timeout — on the library's unreliable/unordered DataChannel a lost chunk just fails reassembly and the message-level logic re-sends. **Application data (`peer.send`) is never chunked** — that remains the developer's responsibility. Small messages travel with a single byte of overhead, so the common case pays almost nothing.
+
+Reassembly is bounded by defensive limits so a malformed or malicious stream can't exhaust memory: each chunk reserves **16 bytes** for its header (so the actual payload per chunk is `max_signal_chunk_size − 16`); partial reassemblies are dropped after **5 s** (`CHUNK_REASSEMBLY_TIMEOUT`); at most **16** partial messages may be in flight at once (`CHUNK_MAX_OPEN`); and any message claiming more than **65536** chunks (`CHUNK_MAX_TOTAL`) is rejected outright. These are internal constants — `max_signal_chunk_size` is the only one you configure.
+
+### Reliable Stream Maps
+
+The `MEDIASTREAM_MAP` (which tells the remote side how MIDs map to tagged streams) is delivered with an ACK + retransmit scheme, since it travels over the unreliable DataChannel. The receiver ACKs every copy (including duplicates); the sender retransmits with backoff until acknowledged, so a dropped map can't leave the two peers with mismatched stream associations.
+
+### End-of-Candidates Signaling
+
+When ICE gathering completes, the library sends the total candidate count per ufrag to the remote peer. The receiver tracks how many candidates it has processed and calls `addIceCandidate(null)` when all have arrived. This signals the browser's ICE agent that gathering is complete, enabling faster candidate pair selection instead of waiting for the default gathering timeout.
+
+### Automatic ICE Restart
+
+The library drives ICE-restart decisions from a single source of truth — `iceConnectionState` (the correct signal for ICE-level recovery):
+
+- **`disconnected`** → starts a configurable timer (default 3s). If the connection doesn't recover, triggers ICE restart.
+- **`failed`** → immediate ICE restart.
+- **`connected`** → clears timer, resets retry counter.
+
+Up to 5 retries with backoff. No manual intervention needed — network roaming (Wi-Fi → LTE) is handled transparently. The `disconnect` and `reconnect` events let your UI react immediately.
+
+### Transceiver Recycling & Cleanup
+
+When a track is removed, its transceiver is set to `inactive` (not stopped). The m-line stays in the SDP at its original position, preserving ordering. When a new track of the same kind is added later, the inactive transceiver is reused — no new m-line, no renegotiation overhead. Transceivers are created only by the offering side, right before `createOffer()`, preventing index conflicts during glare.
+
+**Automatic cleanup:** Transceivers that are no longer mapped to any logical stream are cleaned up after 1.5 seconds. This prevents dead m-lines from accumulating in the SDP over long sessions with many add/remove cycles.
+
+### Tagged Stream Mapping
+
+Each stream is identified by a user-defined tag (e.g., `'camera'`, `'screen'`). The library sends a sequenced `MEDIASTREAM_MAP` message that maps tag IDs to SDP MIDs. The receiving peer uses this map to associate incoming transceivers with logical streams — so it knows that MID 1 is `camera` video and MID 2 is `camera` audio. The sequence number prevents out-of-order map updates from corrupting the mapping.
+
+### DataChannel Deduplication
+
+If both peers create a DataChannel before the nonce exchange resolves roles (a race condition during startup), multiple DataChannels may end up open. The library detects this and picks a winner — the channel with the lowest SID (SCTP stream identifier). All other channels are closed immediately. This prevents duplicate message delivery and m-line ordering conflicts.
+
+### Shared DTLS Certificate
+
+The library pre-generates a single ECDSA P-256 certificate and shares it across all `StableWebRTC` instances on the same page. This eliminates the ~50–200ms certificate generation latency that normally blocks each new `RTCPeerConnection`. The certificate is cached until expiry and regenerated automatically.
+
+### DataChannel Backpressure
+
+Bounded queues with dual quotas (messages and bytes), watermark-based pacing, and drain notifications keep DataChannels responsive under load. Configurable limits:
+
+```js
+connection.data_channel_max_sending_messages_per_sec  // default: 1000
+connection.data_channel_max_sending_bytes_per_sec     // default: 64KB
+connection.data_channel_min_buffered_amount           // default: 64KB
+connection.data_channel_max_buffered_amount           // default: 1MB
+```
+
+### Network Profiling
+
+The library characterizes the **user's own network** (independent of any specific peer) by analyzing local ICE candidates against multiple STUN servers, and emits a `networkprofile` event once the data is available (and again only if it changes):
+
+```js
+peer.on('networkprofile', (p) => {
+  // p.public_ipv4       — your public IPv4 (from STUN), or null
+  // p.public_ipv6       — your public IPv6, or null
+  // p.all_public_ipv4   — array (multiple interfaces)
+  // p.local_ipv4        — local host IPv4, or null (mDNS-hidden)
+  // p.symmetric_nat     — true = problematic, false = fine, null = couldn't tell
+  // p.supports_udp      — is UDP usable at all
+  // p.supports_tcp
+  // p.needs_relay       — derived hint: a TURN relay is likely required
+});
+```
+
+`symmetric_nat` is the key signal: a symmetric NAT maps the same local socket to a *different* external address per destination, so direct P2P generally fails and a TURN relay is needed. It's detected by comparing the reflexive mappings reported by several STUN servers — a **heuristic hint**, not a guarantee (STUN-based NAT typing is inherently unreliable; treat `null` as "unknown" rather than "fine"). Useful for deciding whether to allocate TURN up front, warning the user, or choosing `iceTransportPolicy: 'relay'`.
+
+> Note: there is no *remote* NAT type — it can't be measured from your side. Once connected, `connectioninfo.remote.candidateType` tells you how the path to the peer was actually established (`host` / `srflx` / `relay`), which is the operative fact.
+
+### Connection Observability
+
+Full connection telemetry available via `peer.getConnectionInfo()`:
+
+```js
+var info = peer.getConnectionInfo();
+// info.type             — 'direct-udp', 'direct-tcp', 'relayed', 'unknown'
+// info.rtt              — round-trip time (ms)
+// info.bandwidth_outgoing — estimated outgoing bandwidth (bits/sec)
+// info.local.ip         — local IP address
+// info.local.port       — local port
+// info.local.protocol   — 'udp' or 'tcp'
+// info.local.relay      — true if using TURN
+// info.local.candidateType — 'host', 'srflx', 'prflx', 'relay'
+// info.remote.*         — same fields for remote side
+
+// For network-level characterization (NAT, public IP, UDP support),
+// listen to the `networkprofile` event — see "Network Profiling" above.
+```
+
+### Stream Telemetry
+
+Per-stream stats are computed automatically from `getStats()` — no manual polling or delta computation needed:
+
+```js
+var streams = peer.getStreams();
+// streams['camera'].sending.video.bitrate      — bits/sec
+// streams['camera'].sending.video.fps          — frames per second
+// streams['camera'].sending.video.width        — frame width
+// streams['camera'].sending.video.height       — frame height
+// streams['camera'].sending.video.codec        — e.g. 'video/VP8'
+// streams['camera'].sending.video.active       — true if actively sending
+
+// Receiving side includes quality metrics:
+// streams['camera'].receiving.video.packetLoss — percentage (0–100)
+// streams['camera'].receiving.video.jitter     — seconds
+// streams['camera'].receiving.audio.bitrate    — bits/sec
+
+// Use the streamstats event for reactive updates:
+peer.on('streamstats', (tagId, direction, stats) => {
+  updateQualityUI(tagId, stats.video.bitrate, stats.video.packetLoss);
+});
 ```
 
 ---
 
-
-## 📘 API
+## API Reference
 
 ### Constructor
 
-#### Node.js
-
 ```js
-var wrtc = require('@roamhq/wrtc'); 
-var StableWebRTC = require('stable-webrtc'); 
-
-var peer = new StableWebRTC({
-  wrtc: wrtc,
-  // ... your options
-});
+var peer = new StableWebRTC(options);
 ```
 
-#### Browser
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `iceServers` | Array | Google + Twilio STUN | ICE server configuration |
+| `wrtc` | Object | — | Node.js only: WebRTC bindings (`@roamhq/wrtc`) |
+| `exclude_host_candidates` | Boolean | `false` | If `true`, host candidates aren't sent (privacy; breaks same-LAN direct paths) |
+| `max_signal_chunk_size` | Number | `1024` | Max bytes per signaling message before chunking (both pipes) |
+| `gatheringTimeout` | Number | — | ms before a stuck ICE-gathering triggers a retry |
+| `gatheringMaxRetries` | Number | — | Max gathering-stuck retries before giving up |
+| `certificates` | Array | shared ECDSA P-256 | Custom DTLS certificate(s) |
+| `iceCandidatePoolSize` | Number | — | Pre-gathered candidate pool size |
+| `portRange` | Object | — | Restrict local port range (where supported) |
+| `bundlePolicy` | String | `'balanced'` | BUNDLE policy (`'balanced'`, `'max-bundle'`, `'max-compat'`) |
+| `rtcpMuxPolicy` | String | `'require'` | RTCP mux policy |
 
-```html
-<script src="stable-webrtc.js"></script>
-<script>
-  var peer = new StableWebRTC({
-    // ... your options
-  });
-</script>
-```
+### Properties
 
-Creates a new WebRTC peer connection context.
+| Property | Type | Description |
+|----------|------|-------------|
+| `peer.connected` | Boolean | `true` when DataChannel is open and ready |
+| `peer.connection` | Object | Internal connection state (for advanced inspection) |
 
-Each call to the constructor creates a **new WebRTC connection context**.  
-The library itself does **not** manage connection identity or multiplexing.  
-It is strongly recommended to generate an **external Connection ID** (e.g. session ID) whenever you create a new peer, and attach this ID to all signaling messages you send over your transport.  
+### Methods
 
-This way, when multiple peers are active, each one can reliably determine which signaling messages belong to its own context — preventing cross-talk or corrupted state between different connections.
-
-
-If `options` are provided, they override defaults:
-
-```js
-{
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:global.stun.twilio.com:3478?transport=udp' }
-  ]
-  wrtc: {}, // Node.js only: pass wrtc implementation
-}
-```
-
-**Option descriptions:**
-
-- `wrtc`
-
-  supply Node.js WebRTC bindings (`RTCPeerConnection`, `RTCSessionDescription`, `RTCIceCandidate`).
-
-### Core Methods
-
-- `peer.signal(data)`
-
-  Provide signaling data from the remote peer.
-
-- `peer.send(data)`
-
-  Send text/binary data. Accepts String or Uint8Array.
-
-- `peer.addStream(stream)`
-
-  Add a MediaStream to the connection.
-
-- `peer.removeStream(stream)`
-
-  Remove a MediaStream.
-
-- `peer.addTrack(track, stream)`
-
-  Add a MediaStreamTrack, tied to a specific MediaStream.
-
-- `peer.removeTrack(track, stream)`
-
-  Remove a MediaStreamTrack.
-
-- `peer.close([err])`
-
-  Close and cleanup the peer connection. Optionally emit an error.
-
+| Method | Description |
+|--------|-------------|
+| `peer.signal(data)` | Feed signaling data received from the remote peer |
+| `peer.send(data)` | Send data over DataChannel. Accepts `String`, `Uint8Array`, or `ArrayBuffer` |
+| `peer.write(data)` | Alias of `send` |
+| `peer.stream(tagId, options)` | Add/replace/remove a tagged media stream. `options: { video_track, audio_track }` |
+| `peer.addStream(stream, options?)` | Add a `MediaStream` (auto-extracts tracks) |
+| `peer.removeStream(stream)` | Remove a `MediaStream` |
+| `peer.addTrack(track, stream, options?)` | Add a single `MediaStreamTrack` associated with a stream |
+| `peer.removeTrack(track, stream)` | Remove a single track |
+| `peer.restartIce()` | Manually trigger an ICE restart |
+| `peer.setConfiguration(config)` | Update the underlying `RTCPeerConnection` configuration |
+| `peer.getConnectionInfo()` | Returns connection telemetry (type, RTT, bandwidth, endpoints) |
+| `peer.getStreams(direction?)` | Returns all streams with stats. Optional filter: `'sending'` or `'receiving'` |
+| `peer.on(event, fn)` | Subscribe to an event |
+| `peer.off(event, fn)` | Unsubscribe from an event (same reference required) |
+| `peer.close()` / `peer.destroy()` | Close and clean up the connection |
 
 ### Events
 
-- `peer.on('signal', data)`
-
-  Fires when signaling data should be sent to the remote peer. You must relay it via your signaling transport.
-
-
-- `peer.on('fingerprints')`
-
-  Fires when the both local and remote fingerprints known
-
-- `peer.on('connect')`
-
-  Fires once the peer connection and DataChannel are fully open.
-
-- `peer.on('data', data)`
-
-  Fires on DataChannel messages (Uint8Array).
-
-- `peer.on('stream', stream)`
-
-  Fires on receiving a remote MediaStream.
-
-- `peer.on('track', (track, stream))`
-
-  Fires on receiving a remote track.
-
-- `peer.on('close')`
-
-  Fires when the peer connection closes.
-
-- `peer.on('error', err)`
-
-  Fires on fatal errors (e.g., bad signaling data).
-
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `signal` | `data` (Uint8Array) | Signaling data to relay to the remote peer |
+| `connect` | — | DataChannel is open, connection is ready |
+| `data` | `data` (Uint8Array) | Incoming DataChannel message |
+| `stream` | `mediaStream, info` | Remote media received. `info: { tag_id, video_track, audio_track, video_mid, audio_mid }` |
+| `statechange` | `snapshot` | Any connection state changed. Snapshot includes `negotiation_state`, `signaling_state`, `data_channel_state`, `ice_connection_state`, `connection_state`, `ice_gathering_state`, `sctp_state`, `sctp_dtls_state`, `connection_type`, `rtt`, `bandwidth_outgoing`, `need_ice_restart`, `ice_restart_count`, `epoch` |
+| `connectioninfo` | `info` | Connection type or candidate pair changed. Same format as `getConnectionInfo()` |
+| `networkprofile` | `profile` | Local network characterized. `{ public_ipv4, public_ipv6, all_public_ipv4, all_public_ipv6, local_ipv4, symmetric_nat, supports_udp, supports_tcp, needs_relay }` |
+| `streamstats` | `tagId, direction, stats` | Per-stream stats updated. `direction`: `'sending'` or `'receiving'`. `stats: { video: { active, width, height, fps, codec, bitrate, packetLoss, jitter }, audio: { active, codec, bitrate, packetLoss, jitter } }` |
+| `disconnect` | `{ reason, restartCount }` | ICE connection lost. `reason`: `'disconnected'` or `'failed'`. Automatic ICE restart begins. |
+| `reconnect` | — | ICE connection recovered after a disconnect |
+| `fingerprints` | `localFP, remoteFP` | DTLS fingerprints available for identity verification |
+| `close` | — | Connection closed |
+| `error` | `err` | Error occurred |
+| `log` | `message` | Internal diagnostic message |
 
 ---
 
-## 🚀 Usage Examples
+## Usage Examples
 
-
-### Basic WebRTC connection
-
-This minimal demo shows two peers created inside the same page.  
-⚠️ **Note:** In a real application, the peers would usually live in different browsers/devices, and signaling would be exchanged through a server (e.g. WebSocket) until the P2P connection is ready.
+### Video Call
 
 ```js
-// Create two peers in the same runtime
-var peer1 = new StableWebRTC();
-var peer2 = new StableWebRTC();
+var peer = new StableWebRTC();
 
-// Wire up signaling (here, direct relay just for demo)
-peer1.on('signal', function (data) {
-  peer2.signal(data);
-});
+// Signaling — relay via your server
+peer.on('signal', data => ws.send(data));
+ws.onmessage = msg => peer.signal(msg.data);
 
-peer2.on('signal', function (data) {
-  peer1.signal(data);
-});
+// Send camera
+navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+  .then(stream => peer.addStream(stream));
 
-// Once the data channel is open, peer1 can send messages
-peer1.on('connect', function () {
-  peer1.send('Hello peer2, this is peer1 speaking!');
-});
-
-// peer2 listens for data messages
-peer2.on('data', function (msg) {
-  console.log('peer2 received:', msg.toString());
+// Receive remote video
+peer.on('stream', (mediaStream, info) => {
+  document.querySelector('video').srcObject = mediaStream;
 });
 ```
 
-
-### Dynamic media
+### Tagged Streams (camera + screenshare)
 
 ```js
-var peer1 = new StableWebRTC();
-var peer2 = new StableWebRTC();
-
-// Demo signaling (in a real app, relay over WebSocket/HTTP/etc.)
-peer1.on('signal', function (data) { peer2.signal(data); });
-peer2.on('signal', function (data) { peer1.signal(data); });
-
-// When peer2 receives remote media, render it
-peer2.on('track', function (track, remoteStream) {
-  // Ensure we attach the combined stream to a <video>
-  var video = document.querySelector('video');
-  if (!video) return;
-
-  if ('srcObject' in video) {
-    video.srcObject = remoteStream;
-  } else {
-    // Older browsers
-    video.src = window.URL.createObjectURL(remoteStream);
-  }
-  video.play();
-});
-
-// Helper: add all tracks from a local MediaStream to peer1
-function addMedia(stream) {
-  // Prefer track-level APIs (more flexible than addStream)
-  var tracks = stream.getTracks();
-  for (var i = 0; i < tracks.length; i++) {
-    var t = tracks[i];
-    // Attach track to its parent stream for proper MID/association
-    peer1.addTrack(t, stream);
-  }
-}
-
-// …later, when the user decides to turn on camera/mic:
+// Camera — tagged as 'camera'
 navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-  .then(function (stream) {
-    addMedia(stream);
-  })
-  .catch(function (err) {
-    console.log('getUserMedia failed:', err && err.message ? err.message : err);
+  .then(stream => {
+    peer.stream('camera', {
+      video_track: stream.getVideoTracks()[0],
+      audio_track: stream.getAudioTracks()[0]
+    });
   });
 
-/*
-Optional extras:
+// Screen share — tagged as 'screen'
+navigator.mediaDevices.getDisplayMedia({ video: true })
+  .then(stream => {
+    peer.stream('screen', { video_track: stream.getVideoTracks()[0] });
+  });
 
-// To stop sending media later:
-function removeMedia(stream) {
-  var tracks = stream.getTracks();
-  for (var i = 0; i < tracks.length; i++) {
-    peer1.removeTrack(tracks[i], stream);
-    tracks[i].stop();
+// Stop screen share
+peer.stream('screen', { video_track: null });
+
+// On the receiving side:
+peer.on('stream', (mediaStream, info) => {
+  if (info.tag_id === 'camera') {
+    document.getElementById('camera-video').srcObject = mediaStream;
+  } else if (info.tag_id === 'screen') {
+    document.getElementById('screen-video').srcObject = mediaStream;
   }
-}
+});
+```
 
-// To add screen share dynamically:
-function addScreen() {
-  navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
-    .then(function (screenStream) { addMedia(screenStream); })
-    .catch(function (e) { console.log('getDisplayMedia failed:', e); });
+### Reactive Connection Status UI
+
+```js
+var peer = new StableWebRTC();
+
+// Connection lifecycle — no polling needed
+peer.on('connect', () => {
+  showStatus('connected');
+});
+
+peer.on('disconnect', (info) => {
+  showStatus('reconnecting (' + info.reason + ')...');
+});
+
+peer.on('reconnect', () => {
+  showStatus('connected');
+});
+
+peer.on('close', () => {
+  showStatus('disconnected');
+});
+
+// Connection quality — reactive updates
+peer.on('connectioninfo', (info) => {
+  showConnectionType(info.type);     // 'direct-udp', 'relayed', etc.
+  showLatency(info.rtt);             // 2.1 ms
+});
+
+// Per-stream quality — reactive updates
+peer.on('streamstats', (tagId, direction, stats) => {
+  if (direction === 'receiving') {
+    showBitrate(tagId, stats.video.bitrate);
+    showPacketLoss(tagId, stats.video.packetLoss);
+    if (stats.video.packetLoss > 5) {
+      showQualityWarning(tagId);
+    }
+  }
+});
+
+// State machine visibility (for debugging)
+peer.on('statechange', (snap) => {
+  console.log('negotiation:', snap.negotiation_state,
+              'ice:', snap.ice_connection_state,
+              'dc:', snap.data_channel_state);
+});
+```
+
+### Event Cleanup (React, Vue, etc.)
+
+```js
+function setupPeer(peer) {
+  var onStream = (ms, info) => { /* ... */ };
+  var onStats = (tag, dir, stats) => { /* ... */ };
+
+  peer.on('stream', onStream);
+  peer.on('streamstats', onStats);
+
+  // Cleanup — removes the specific listener
+  return function cleanup() {
+    peer.off('stream', onStream);
+    peer.off('streamstats', onStats);
+    peer.close();
+  };
 }
-*/
 ```
 
 ### Mesh Network (N peers)
 
 ```js
-// Create peers
-var peerA = new StableWebRTC();
-var peerB = new StableWebRTC();
-var peerC = new StableWebRTC();
+var peers = {};
 
-// Wire up signaling between peers (for demo purposes, direct relay)
-function SignalToPeer(p1, p2) {
-  p1.on('signal', data => p2.signal(data));
-  p2.on('signal', data => p1.signal(data));
+function connectTo(remoteId) {
+  var peer = new StableWebRTC();
+  peers[remoteId] = peer;
+
+  peer.on('signal', data => {
+    server.send({ to: remoteId, signal: data });
+  });
+
+  peer.on('connect', () => {
+    peer.send('Hello from ' + myId);
+  });
+
+  peer.on('data', msg => {
+    console.log(remoteId + ' says:', msg.toString());
+  });
+
+  return peer;
 }
 
-// In a real app you would relay over WebSocket / server
-SignalToPeer(peerA, peerB);
-SignalToPeer(peerA, peerC);
-SignalToPeer(peerB, peerC);
-
-// Handle connections
-peerA.on('connect', () => {
-  peerA.send('Hello from Peer A!');
-});
-
-peerB.on('connect', () => {
-  peerB.send('Hello from Peer B!');
-});
-
-peerC.on('connect', () => {
-  peerC.send('Hello from Peer C!');
-});
-
-// Handle data messages
-peerA.on('data', data => {
-  console.log('Peer A received:', data.toString());
-});
-
-peerB.on('data', data => {
-  console.log('Peer B received:', data.toString());
-});
-
-peerC.on('data', data => {
-  console.log('Peer C received:', data.toString());
+// When receiving signaling from the server:
+server.on('signal', (fromId, data) => {
+  if (!peers[fromId]) connectTo(fromId);
+  peers[fromId].signal(data);
 });
 ```
 
+---
 
-> 📂 For more examples, see [`examples/`](./examples)
+## Security
+
+Every WebRTC connection creates a short-lived DTLS certificate. The `fingerprints` event exposes both peers' certificate fingerprints, enabling end-to-end identity verification — even if the signaling server is compromised.
+
+```js
+peer.on('fingerprints', (localFP, remoteFP) => {
+  // Build a transcript binding this session to both fingerprints
+  var transcript = makeTranscriptHash(localFP, remoteFP);
+
+  // Sign with your application's identity key
+  var signature = sign(transcript, myPrivateKey);
+
+  // Send proof to the remote peer via your signaling channel
+  sendProof(signature);
+});
+
+// When receiving proof from the remote peer:
+onReceiveProof((signature, senderPublicKey) => {
+  // Rebuild the transcript from the remote peer's perspective (reversed)
+  var transcript = makeTranscriptHash(myRemoteFP, myLocalFP);
+
+  if (!verify(transcript, signature, senderPublicKey)) {
+    throw new Error('MITM detected — fingerprint mismatch');
+  }
+
+  // Connection is cryptographically verified
+  markAsVerified();
+});
+```
+
+This is optional — connections work without it. Recommended for messaging, payments, healthcare, and enterprise applications.
 
 ---
 
-## 🔒 Security
-  The fingerprints event provides access to the DTLS certificate fingerprints of both peers in a connection. Every WebRTC session creates a short-lived certificate during the DTLS handshake, and its fingerprint (a cryptographic hash of the certificate) is exchanged inside the SDP. By default, browsers verify that the fingerprint in the SDP matches the certificate used in the handshake, which prevents tampering in transit.
+## Troubleshooting & FAQ
 
-  However, if you don’t fully trust your signaling server, there’s still a risk of a man-in-the-middle (MITM) attack: a compromised or malicious server could swap SDP descriptions between peers. To mitigate this, you can use the fingerprints event for end-to-end identity verification:
+**"Who is the initiator?"**
+You don't choose. Roles are assigned automatically via nonce comparison at startup.
 
-  ```js
-  peer.on('fingerprints', (local_fingerprint, remote_fingerprint) => {
+**"What if both peers add video at the same time?"**
+Glare is resolved deterministically. One peer yields (rolls back), the other's offer goes through. The yielding peer re-sends its tracks in the next negotiation cycle. No deadlocks, no dropped tracks.
 
-  });
-  ```
+**"What signaling transport should I use?"**
+Anything. WebSocket, HTTP long-polling, MQTT, Server-Sent Events, UDP, even SMS. The library handles reordering, deduplication, and compression. Signaling messages are binary Uint8Arrays — relay them as-is.
 
-  When the event fires, you receive both the `local_fingerprint` and the `remote_fingerprint`.
+**"How do I know the connection quality?"**
+Use the `connectioninfo` event for connection-level info (type, RTT, bandwidth) and `streamstats` for per-stream metrics (bitrate, packet loss, jitter). No polling needed — both are event-driven.
 
-  You can sign these fingerprints with an external identity key (for example, a long-term application key) and send the signature over your signaling channel.
+**"How do I show a reconnecting UI?"**
+Listen to `disconnect` and `reconnect` events. The library handles ICE restart automatically — you just update the UI.
 
-  On the receiving side, you validate the signature against the expected peer’s key.
+**"Can I use this with an SFU?"**
+The library is designed for peer-to-peer connections. For SFU integration (Janus, mediasoup, etc.), you'd use the signaling layer directly but not the media negotiation, since the SFU controls the offer/answer flow.
 
-  This ensures that even if the signaling server is tampered with, the peers can still prove to each other that they are talking to the correct identity.
-
-  It’s not mandatory—WebRTC connections work without it—but it’s a recommended practice for applications that need higher security, such as messaging, payments, or enterprise communication. It prevents undetected MITM attacks and provides strong cryptographic assurance of peer identity.
-
-  Example usage:
-
-  ```js
-    peer.on('fingerprints', (localFP, remoteFP) => {
-
-    // Build a transcript that binds this session to both fingerprints
-    const transcriptHash = makeTranscriptHash(localFP, remoteFP);
-
-    // Sign the transcript with your private identity key
-    const signature = sign(transcriptHash, myPrivateKey());
-
-    // Send proof to the other peer
-    sendProofSomehow(signature);
-  });
-
-  //when you get proof from the other peer...
-  onGetProofSomehow((signature) => {
-
-    // Get my current fingerprints from my own connection context...
-    const myLocalFP  = myLocalFP();
-    const myRemoteFP = myRemoteFP();
-
-    // Rebuild the transcript exactly as the sender saw it
-    const remoteTranscriptHash = makeTranscriptHash(myRemoteFP, myLocalFP);
-
-    // Verify the signature with the sender’s public key and signature
-    const ok = verify(remoteTranscriptHash, senderSignature, senderPublicKey);
-    if (!ok) return reject('invalid signature');
-
-    // If verification passed, mark the peer webrtc connection as trusted
-    markPeerAsVerified();
-  });
-
-  ```
+**"What about Firefox / Safari?"**
+The library targets Unified Plan (the standard). Chrome, Firefox, and Safari all support it. Edge cases around rollback behavior differ slightly between browsers — the library accounts for this.
 
 ---
 
-## 🧪 Troubleshooting & FAQ
-
-**“Who is the initiator?”** 
-  You don’t choose—roles are assigned automatically and glare is resolved deterministically.
-
-**“Why not a simpler wrapper?”** 
-  stable‑webrtc focuses on **deterministic negotiation + resilient signaling + compression + DC routing**—the tricky parts you hit at scale.
-
----
-
-## 💡 Support
+## Support
 
 _Please ⭐ star the repo to follow progress!_
 
-Stable-WebRTC is an evenings-and-weekends project.  
+Stable-WebRTC is an evenings-and-weekends project.
 Support development via **GitHub Sponsors** or simply share the project.
 
 ---
 
-## 📜 License
+## License
 
 **Apache License 2.0**
 

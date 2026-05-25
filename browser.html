@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>stable-webrtc — negotiation trace</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; max-width: 1100px; margin: 24px auto; padding: 0 16px; background:#0b1020; color:#cfe; }
+  h1 { font-size: 16px; font-family: system-ui, sans-serif; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .col { background:#11182f; border:1px solid #243; border-radius:8px; padding:10px; }
+  .col h2 { font-size:13px; margin:0 0 8px; color:#9fd; font-family:system-ui; }
+  table { width:100%; border-collapse:collapse; }
+  td { padding:1px 4px; vertical-align:top; }
+  td.k { color:#89a; width:46%; }
+  td.v { color:#fff; font-weight:600; }
+  .v.good { color:#7CFC9B; } .v.bad { color:#ff8080; } .v.warn { color:#ffd479; }
+  #log { background:#070b16; border:1px solid #243; border-radius:8px; padding:10px; height:280px; overflow:auto; white-space:pre-wrap; margin-top:14px; }
+  .a { color:#7fd1ff; } .b { color:#ffb37f; } .ok { color:#7CFC9B; } .err { color:#ff8080; } .dim { color:#6680a0; }
+  .verdict { font-family:system-ui; font-size:14px; padding:10px; border-radius:8px; margin:14px 0; }
+  .verdict.ok { background:#0c2e16; color:#7CFC9B; } .verdict.bad { background:#2e0c0c; color:#ff8080; } .verdict.wait { background:#2e260c; color:#ffd479; }
+</style>
+</head>
+<body>
+  <h1>stable-webrtc — negotiation trace (A ⇄ B loopback)</h1>
+  <div id="verdict" class="verdict wait">running…</div>
+  <div class="grid">
+    <div class="col"><h2 class="a">Peer A — state</h2><table id="stA"></table></div>
+    <div class="col"><h2 class="b">Peer B — state</h2><table id="stB"></table></div>
+  </div>
+  <div id="log"></div>
+
+  <script src="../dist/stable-webrtc.browser.js"></script>
+  <script>
+  (function(){
+    var logEl = document.getElementById('log');
+    var verdictEl = document.getElementById('verdict');
+    var t0 = Date.now();
+    function ts(){ return ('   '+((Date.now()-t0)/1000).toFixed(2)).slice(-7); }
+    function log(who, msg, cls){
+      var d = document.createElement('div');
+      d.innerHTML = '<span class="dim">'+ts()+'s</span> <span class="'+(who==='A'?'a':who==='B'?'b':'dim')+'">['+who+']</span> <span class="'+(cls||'')+'">'+msg+'</span>';
+      logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight;
+    }
+    function verdict(txt, cls){ verdictEl.textContent = txt; verdictEl.className = 'verdict '+cls; }
+    function esc(s){ return String(s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+
+    if (typeof window.StableWebRTC !== 'function'){
+      verdict('✗ window.StableWebRTC is not a function — bundle not loaded. Run: node build-browser.js', 'bad');
+      return;
+    }
+
+    // ---- INSTRUMENT native WebRTC to get ground truth on candidate/SDP handling ----
+    // (patches the prototype before any peer is created; logs every call + outcome)
+    var addCount = { ok: 0, fail: 0 };
+    (function instrument(){
+      var P = window.RTCPeerConnection && window.RTCPeerConnection.prototype;
+      if (!P || P.__swrtc_instrumented) return;
+      P.__swrtc_instrumented = true;
+
+      var origAdd = P.addIceCandidate;
+      P.addIceCandidate = function(cand){
+        var c = cand && cand.candidate ? cand.candidate : (cand && cand.toJSON ? cand.toJSON().candidate : '');
+        var p = origAdd.apply(this, arguments);
+        if (p && p.then){
+          return p.then(function(r){
+            if (c) { addCount.ok++; log('pc', 'addIceCandidate OK: '+esc(c), 'ok'); }
+            return r;
+          }, function(err){
+            addCount.fail++;
+            log('pc', 'addIceCandidate REJECTED: '+esc(err && err.message || err)+'  ←  '+esc(c), 'err');
+            throw err;
+          });
+        }
+        return p;
+      };
+
+      var origSRD = P.setRemoteDescription;
+      P.setRemoteDescription = function(desc){
+        var type = desc && desc.type;
+        var p = origSRD.apply(this, arguments);
+        if (p && p.then){
+          return p.then(function(r){ log('pc', 'setRemoteDescription('+type+') OK', 'dim'); return r; },
+                        function(err){ log('pc', 'setRemoteDescription('+type+') FAILED: '+esc(err && err.message||err), 'err'); throw err; });
+        }
+        return p;
+      };
+    })();
+
+    var signals = { A2B: 0, B2A: 0 };
+    var connected = { A: false, B: false };
+
+    var GOOD = { signaling_state:'stable', ice_connection_state:'connected', connection_state:'connected',
+                 data_channel_state:'open', sctp_state:'connected', ice_gathering_state:'complete' };
+    function cls(k, v){
+      if (v == null) return '';
+      if (String(v).indexOf('fail') >= 0 || String(v).indexOf('closed') >= 0 || String(v).indexOf('disconnect') >= 0) return 'bad';
+      if (GOOD[k] && v === GOOD[k]) return 'good';
+      if (k==='signaling_state' && v!=='stable') return 'warn';
+      if ((k==='ice_connection_state'||k==='connection_state') && (v==='checking'||v==='new'||v==='connecting')) return 'warn';
+      return '';
+    }
+    function render(id, snap){
+      var keys = ['negotiation_state','signaling_state','ice_gathering_state','ice_connection_state',
+                  'connection_state','sctp_state','sctp_dtls_state','data_channel_state',
+                  'connection_type','rtt','epoch'];
+      var html = '';
+      keys.forEach(function(k){
+        var v = snap[k];
+        html += '<tr><td class="k">'+k+'</td><td class="v '+cls(k,v)+'">'+(v==null?'—':v)+'</td></tr>';
+      });
+      document.getElementById(id).innerHTML = html;
+    }
+
+    function wire(peer, who, other){
+      peer.on('signal', function(data){
+        var n = (who==='A') ? (++signals.A2B) : (++signals.B2A);
+        var len = (data && (data.byteLength!=null?data.byteLength:data.length)) || '?';
+        log(who, 'signal #'+n+' → '+(who==='A'?'B':'A')+' ('+len+' bytes)');
+        try { other.signal(data); }
+        catch(e){ log(who, 'EXCEPTION in '+(who==='A'?'B':'A')+'.signal(): '+e.message, 'err'); }
+      });
+      peer.on('statechange', function(s){ render(who==='A'?'stA':'stB', s); });
+      peer.on('log',          function(m){ log(who, 'log: '+m, 'dim'); });
+      peer.on('connect',      function(){ connected[who]=true; log(who, 'CONNECT (data channel open)', 'ok'); checkDone(); });
+      peer.on('connectioninfo',function(i){ log(who, 'connectioninfo: type='+(i&&i.type)+' rtt='+(i&&i.rtt), 'dim'); });
+      peer.on('fingerprints', function(){ log(who, 'fingerprints exchanged', 'dim'); });
+      peer.on('disconnect',   function(d){ log(who, 'DISCONNECT '+JSON.stringify(d||{}), 'err'); });
+      peer.on('reconnect',    function(){ log(who, 'reconnect', 'warn'); });
+      peer.on('close',        function(){ log(who, 'close', 'err'); });
+      peer.on('error',        function(e){ log(who, 'ERROR: '+(e&&e.message||e), 'err'); });
+      peer.on('data',         function(d){
+        var t = (typeof d==='string')?d:new TextDecoder().decode(d);
+        log(who, 'data recv: "'+t+'"', 'ok');
+        if (t==='ping') peer.send('pong');
+        if (t==='pong') verdict('✓ FULLY WORKING — connected + data round-trip (ping↔pong)', 'ok');
+      });
+    }
+
+    function checkDone(){
+      if (connected.A && connected.B){
+        verdict('✓ both peers connected — sending ping…', 'ok');
+        log('—', 'both connected; A.send("ping")', 'ok');
+        try { peerA.send('ping'); } catch(e){ log('A','send threw: '+e.message,'err'); }
+      }
+    }
+
+    log('—', 'creating two peers (native WebRTC, symmetric)…', 'dim');
+    var peerA = new window.StableWebRTC({});
+    var peerB = new window.StableWebRTC({});
+    wire(peerA, 'A', peerB);
+    wire(peerB, 'B', peerA);
+
+    var ticks = 0;
+    var iv = setInterval(function(){
+      ticks++;
+      [['A',peerA,'stA'],['B',peerB,'stB']].forEach(function(p){
+        var pc = p[1].connection && p[1].connection.pc;
+        if (pc){
+          var tbl = document.getElementById(p[2]);
+          var foot = tbl.querySelector('tr.live') || (function(){ var r=document.createElement('tr'); r.className='live'; tbl.appendChild(r); return r; })();
+          foot.innerHTML = '<td class="k">live pc</td><td class="v '+(pc.iceConnectionState==='connected'||pc.connectionState==='connected'?'good':pc.iceConnectionState==='failed'?'bad':'warn')+'">'+pc.iceConnectionState+' / '+pc.connectionState+'</td>';
+        }
+      });
+
+      if (ticks === 24 && !(connected.A && connected.B)){
+        clearInterval(iv);
+        var diag = 'signals A→B: '+signals.A2B+', B→A: '+signals.B2A+'. addIceCandidate ok='+addCount.ok+' rejected='+addCount.fail+'. ';
+        if (signals.A2B===0 && signals.B2A===0) diag += 'NO signals — negotiation never started (cert/PC creation?).';
+        else if (addCount.ok===0 && addCount.fail>0) diag += 'ALL candidates REJECTED — malformed candidate string (see red lines above).';
+        else if (addCount.ok===0 && addCount.fail===0) diag += 'NO candidates ever added — candidates not being sent/decoded.';
+        else diag += 'Candidates added OK but ICE still checking — likely mDNS/loopback or network (not a codec bug).';
+        verdict('✗ NOT connected after 12s. '+diag, 'bad');
+        log('—', diag, 'err');
+      }
+    }, 500);
+  })();
+  </script>
+</body>
+</html>
