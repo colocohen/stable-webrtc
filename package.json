@@ -1,6 +1,6 @@
 {
   "name": "stable-webrtc",
-  "version": "0.5.0",
+  "version": "0.5.6",
   "description": "A production-grade WebRTC library for Node.js & Browsers. Handles glare, renegotiation conflicts, out-of-order signaling, NAT quirks, and bloated SDPs so you can build reliable real-time apps faster.",
   "type": "module",
   "main": "index.js",

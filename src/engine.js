@@ -29,7 +29,7 @@ import {
   SCHEMA_SIGNAL_ENVELOPE, SCHEMA_SIGNAL_INNER, SCHEMA_DC_MSG,
   SCHEMA_SEQ_PAYLOAD, SCHEMA_SEQ_HASH_HASH_PAYLOAD, SCHEMA_NEG_DONE,
   SCHEMA_FAILD_DECOMPRESS, SCHEMA_TOTAL_ICE,
-  SCHEMA_SIGNAL_FRAME, SCHEMA_SIGNAL_CHUNK, SCHEMA_ACK
+  SCHEMA_SIGNAL_FRAME, SCHEMA_SIGNAL_CHUNK, SCHEMA_ACK, SCHEMA_PING
 } from './schemas.js';
 
 export default StableWebRTC;
@@ -134,7 +134,9 @@ var _TD = new TextDecoder();
 
     MEDIASTREAM_MAP_ACK: 18,
 
-    SIGNAL_CHUNK: 19
+    SIGNAL_CHUNK: 19,
+
+    PONG: 20
   };
 
 export function StableWebRTC(opts){
@@ -232,8 +234,31 @@ export function StableWebRTC(opts){
       current_local_candidate_type: null,
       current_remote_candidate_type: null,
       current_rtt: null,
+      current_ping_rtt: null,
       current_bandwidth_outgoing: null,
       current_connection_type: 'unknown',
+
+      // Application-level ping/pong keepalive + RTT probe (over the signal
+      // channel, i.e. the data channel once open). Mirrors the WS manager:
+      // PING carries a timestamp, the peer echoes it back as PONG, and we
+      // compute RTT against our own clock. Random interval avoids lockstep.
+      ping_timer: null,
+      ping_enabled: true,
+      ping_interval_min: 1000,
+      ping_interval_max: 3000,
+
+      // Liveness watchdog. ICE-lite peers (e.g. a webrtc-server answerer) run
+      // NO connectivity checks of their own, so their iceConnectionState rarely
+      // moves to 'disconnected'/'failed' when the link dies — they just sit in
+      // 'connected' forever. We therefore detect death independently: any
+      // inbound DC traffic (data/signal/pong) refreshes last_recv_time, and a
+      // watchdog declares the link dead if nothing arrives within the timeout.
+      // Recovery then goes through the same ICE-restart path; if that is
+      // exhausted, we close. Needs to outlast a few ping intervals.
+      liveness_timer: null,
+      liveness_enabled: true,
+      liveness_timeout_ms: 10000,
+      last_recv_time: 0,
 
       // Track previous ice state for disconnect/reconnect events
       _prev_ice_connection_state: null,
@@ -340,16 +365,60 @@ export function StableWebRTC(opts){
       data_channel_max_sending_messages_per_sec: 1000,
       data_channel_max_sending_bytes_per_sec: 64*1024,
 
+      // A queued message that still hasn't reached the wire after this long is dropped
+      // and its callback settled as failed. Defaults to liveness_timeout_ms: if nothing
+      // has moved for that long the peer is already being declared dead, so a message
+      // still sitting in the queue is never going out.
+      data_channel_max_queue_age: 10000,
+
       data_channel_pump_queue_timer: null,
 
       data_channel_sent_events: [],
       data_channel_recv_events: [],
+
+      // ICE server failures, deduped by "url|errorCode" so a broken TURN can't
+      // spam events: { "url|code": {url, code, text, count, first_ts, last_ts} }
+      ice_server_errors: {},
+
+      // Malformed inbound frames that were dropped rather than allowed to throw.
+      stats_dropped_malformed: 0,
+      last_malformed_emit_ts: 0,
+
+      // Queued outbound messages dropped because they aged past data_channel_max_queue_age.
+      stats_dropped_expired: 0,
+      last_expired_emit_ts: 0,
+
+      // Send attempts that threw but left the message queued for a later retry.
+      stats_send_failures: 0,
+      last_send_failure_emit_ts: 0,
     };
 
-    
+    // Guard used before any access to connection.pc.<prop> in code paths that
+    // may run after cleanup (async callbacks, timers, promise .then handlers).
+    // Cleanup sets connection.pc=null after calling pc.close(), so returning
+    // false here means the peer connection is either not yet created or gone.
+    function pc_alive(){
+      return connection.pc!==null && connection.pc.connectionState!=='closed';
+    }
+
+    // A malformed inbound frame is a routine event, not a fatal one: a buggy or
+    // hostile peer can put arbitrary bytes on the wire, and litepack.decode throws
+    // on garbage. Dropping the frame is the correct response — but the throw must
+    // never escape an event handler, or it kills the whole process.
+    // Every drop is counted; the 'error' emit is rate-limited to once per second so
+    // a flood of bad frames cannot drown the app in events.
+    function report_malformed_frame(source, error){
+      connection.stats_dropped_malformed++;
+
+      var now=Date.now();
+      if(now-connection.last_malformed_emit_ts>=1000){
+        connection.last_malformed_emit_ts=now;
+        ev.emit('error','malformed inbound frame on '+source+' — dropped ('+connection.stats_dropped_malformed+' total): '+((error && error.message) ? error.message : String(error)));
+      }
+    }
 
     function drain_pending_remote_candidates(){
-      if (connection.pc && connection.pc.connectionState!=='closed' && connection.pc.remoteDescription && connection.pc.remoteDescription.type) {
+      if (pc_alive() && connection.pc.remoteDescription && connection.pc.remoteDescription.type) {
         var current_remote_ufrag=get_ufrag_from_sdp(connection.pc.remoteDescription.sdp);
 
         // Candidates are bucketed by ufrag. Browsers tag each trickled candidate
@@ -455,7 +524,7 @@ export function StableWebRTC(opts){
     }
 
     function adopt_primary_data_channel(){
-      if(connection.pc && connection.pc.connectionState!=='closed'){
+      if(pc_alive()){
 
         var winner_index = null;
         var winner_id = null;
@@ -491,10 +560,17 @@ export function StableWebRTC(opts){
           for (var i = 0; i < connection.list_data_channels.length; i++) {
             var dc = connection.list_data_channels[i];
             if(dc && i !== winner_index){
-              // Close ALL non-primary DCs: open ones with different IDs AND connecting ones
-              // (connecting DCs are unnegotiated duplicates that will never open
-              //  and cause m-line order conflicts if left alive)
-              if(dc.readyState == 'open' || dc.readyState == 'connecting'){
+              // Only close losers that are OPEN — never 'connecting'.
+              // A connecting channel hasn't been seen open by BOTH ends yet, so the
+              // lowest-id decision isn't global at that moment. Closing it is what
+              // allowed the two ends to adopt DIFFERENT primaries under startup
+              // glare (each killing the other's choice → crossed half-open channels
+              // → one side's send pump starves silently while the other direction
+              // keeps flowing). A connecting loser either opens later — adopt
+              // re-runs on its onopen, both ends then see both channels open,
+              // compute the SAME winner and close the SAME loser — or it never
+              // opens and dies with the connection.
+              if(dc.readyState == 'open'){// || dc.readyState == 'connecting'
                 try { dc.close(); } catch (e) {}
               }
             }
@@ -642,6 +718,9 @@ export function StableWebRTC(opts){
           connection_getstats();
 
           data_channel_schedule_pump();
+
+          start_ping();
+          start_liveness();
         }
 
         if(connection.negotiation_state!==prev['negotiation_state']){
@@ -763,7 +842,7 @@ export function StableWebRTC(opts){
     }
 
     function add_data_channel(dc){
-      if(connection.pc && connection.pc.connectionState!=='closed'){
+      if(pc_alive()){
         
         var dc_index=connection.list_data_channels.push(dc);
 
@@ -776,31 +855,41 @@ export function StableWebRTC(opts){
 
         dc.onmessage=function(event){
           var now = Date.now();
+          connection.last_recv_time = now;   // any inbound traffic proves the peer is alive
           var bytes=event.data.byteLength||event.data.length||0;
           connection.data_channel_recv_events.push([now,bytes]);
           while (connection.data_channel_recv_events.length && (now - connection.data_channel_recv_events[0][0]) > 1000){
             connection.data_channel_recv_events.shift();
           }
 
-          var _dcmsg=litepack.decode(SCHEMA_DC_MSG,event.data);
-          if(_dcmsg.type==MSGCODE_TYPE_MAP['SIGNAL_CHUNK']){
-            // A fragment of an oversized signaling message. Reassemble; once the
-            // whole DC_MSG is back, decode and dispatch it by its real type.
-            var _whole=reassemble_chunk(_dcmsg.data,connection.chunk_reasm_internal);
-            if(_whole!==null){
-              var _inner=litepack.decode(SCHEMA_DC_MSG,_whole);
-              if(_inner.type==MSGCODE_TYPE_MAP['DATA']){
-                ev.emit('data', _inner.data);
-              }else{
-                process_income_signal(_inner.type,_inner.data);
+          // Everything below decodes peer-supplied bytes. litepack.decode throws on
+          // garbage, and this is an event handler — an escaping throw is unhandled and
+          // takes the process with it. Drop the frame instead.
+          // (last_recv_time is refreshed above, outside the try: even a corrupt frame
+          // proves the transport is still delivering, which is all liveness cares about.)
+          try{
+            var _dcmsg=litepack.decode(SCHEMA_DC_MSG,event.data);
+            if(_dcmsg.type==MSGCODE_TYPE_MAP['SIGNAL_CHUNK']){
+              // A fragment of an oversized signaling message. Reassemble; once the
+              // whole DC_MSG is back, decode and dispatch it by its real type.
+              var _whole=reassemble_chunk(_dcmsg.data,connection.chunk_reasm_internal);
+              if(_whole!==null){
+                var _inner=litepack.decode(SCHEMA_DC_MSG,_whole);
+                if(_inner.type==MSGCODE_TYPE_MAP['DATA']){
+                  ev.emit('data', _inner.data);
+                }else{
+                  process_income_signal(_inner.type,_inner.data);
+                }
               }
+            }else if(_dcmsg.type==MSGCODE_TYPE_MAP['DATA']){
+              ev.emit('data', _dcmsg.data);
+            }else{
+              process_income_signal(_dcmsg.type,_dcmsg.data);
             }
-          }else if(_dcmsg.type==MSGCODE_TYPE_MAP['DATA']){
-            ev.emit('data', _dcmsg.data);
-          }else{
-            process_income_signal(_dcmsg.type,_dcmsg.data);
+          }catch(error){
+            report_malformed_frame('datachannel', error);
           }
-          
+
         };
 
         dc.onbufferedamountlow=function(){
@@ -814,7 +903,7 @@ export function StableWebRTC(opts){
         dc.onclose=function(event){
           adopt_primary_data_channel();
 
-          if(connection.pc && connection.pc.connectionState!=='closed'){
+          if(pc_alive()){
             //connection.list_data_channels.splice(dc_index, 1);
           }
         };
@@ -822,7 +911,7 @@ export function StableWebRTC(opts){
         dc.onerror=function(error){
           adopt_primary_data_channel();
 
-          if(connection.pc && connection.pc.connectionState!=='closed'){
+          if(pc_alive()){
             // Extract meaningful error message from RTCErrorEvent
             var msg = error;
             if(error && error.error && error.error.message) msg = error.error.message;
@@ -835,7 +924,7 @@ export function StableWebRTC(opts){
     }
 
     function create_data_channel(){
-      if(connection.pc && connection.pc.connectionState!=='closed'){
+      if(pc_alive()){
         try{
           
           var dc=connection.pc.createDataChannel("dc", {
@@ -859,7 +948,7 @@ export function StableWebRTC(opts){
     }
 
     function connection_getstats(){
-      if(connection.pc && connection.pc.signalingState!=='closed' && connection.pc.getStats){
+      if(pc_alive() && connection.pc.getStats){
 
         if(connection.getstats_running==false){
           connection.getstats_running=true;
@@ -1283,10 +1372,88 @@ export function StableWebRTC(opts){
       
     }
 
+    // ============================================================
+    // Application-level ping/pong (RTT + keepalive).
+    // Modelled on the WS manager: send PING{timestamp} on a randomised
+    // interval; the peer echoes it as PONG{timestamp}; on PONG we compute
+    // rtt = now - timestamp, store it on connection.current_rtt and emit 'rtt'.
+    // Runs only while the data channel is open. send_signal routes it over
+    // the DC, so it costs one tiny datagram per interval.
+    // ============================================================
+    function schedule_ping(){
+      if(connection.ping_enabled===false) return;
+      clearTimeout(connection.ping_timer);
+      var span=Math.max(0,connection.ping_interval_max-connection.ping_interval_min);
+      var delay=connection.ping_interval_min+Math.floor(Math.random()*span);
+      connection.ping_timer=setTimeout(function(){
+        connection.ping_timer=null;
+        if(pc_alive() && connection.data_channel_state==='open'){
+          try{
+            send_signal(MSGCODE_TYPE_MAP['PING'],litepack.encode(SCHEMA_PING,{timestamp:Date.now()}));
+          }catch(error){}
+          schedule_ping();
+        }
+      },delay);
+    }
+
+    function start_ping(){
+      if(connection.ping_enabled===false) return;
+      if(connection.ping_timer!==null) return;   // already running
+      schedule_ping();
+    }
+
+    // Liveness watchdog: declares the link dead when no inbound traffic has
+    // arrived within liveness_timeout_ms. Crucial for ICE-lite peers whose
+    // iceConnectionState won't move off 'connected' when the link dies.
+    function liveness_period(){
+      return Math.max(1000, Math.floor(connection.liveness_timeout_ms/3));
+    }
+
+    function check_liveness(){
+      connection.liveness_timer=null;
+      if(!pc_alive()) return;
+      if(connection.liveness_enabled===false) return;
+
+      var idle=Date.now()-connection.last_recv_time;
+      if(connection.last_recv_time>0 && idle>=connection.liveness_timeout_ms){
+        var ice=connection.pc.iceConnectionState;
+        // Only step in when ICE is oblivious to the break (the ICE-lite blind
+        // spot): it still says connected/completed but nothing is arriving.
+        // When ICE itself reports disconnected/failed, its own handler drives
+        // recovery — don't double-drive the shared restart budget.
+        if(ice==='connected' || ice==='completed'){
+          ev.emit('disconnect', {reason:'timeout', restartCount:connection.ice_restart_count});
+
+          if(connection.ice_restart_count<connection.ice_restart_max_retries){
+            // Try to recover. Reset the marker so this attempt gets a fresh
+            // window; if it works, inbound traffic resumes and refreshes it.
+            connection.ice_restart_count++;
+            connection.last_recv_time=Date.now();
+            restartIce();
+          }else{
+            // Exhausted — give up and close cleanly (emits 'close', frees the PC).
+            ev.emit('error','connection lost — no inbound traffic for '+idle+'ms; closing after '+connection.ice_restart_max_retries+' recovery attempts');
+            close_connection();
+            return;   // close_connection already cleared the timer
+          }
+        }
+      }
+
+      connection.liveness_timer=setTimeout(check_liveness, liveness_period());
+    }
+
+    function start_liveness(){
+      if(connection.liveness_enabled===false) return;
+      if(connection.liveness_timer!==null) return;   // already running
+      connection.last_recv_time=Date.now();
+      connection.liveness_timer=setTimeout(check_liveness, liveness_period());
+    }
+
     function build_connection_info(){
       return {
         type: connection.current_connection_type||'unknown',
-        rtt: connection.current_rtt,
+        rtt: connection.current_rtt,             // ICE/DTLS-level (from getStats; may be null on some bindings)
+        ping_rtt: connection.current_ping_rtt,   // app-level DataChannel round-trip (from ping/pong)
         bandwidth_outgoing: connection.current_bandwidth_outgoing,
         local: {
           ip: connection.current_local_ip,
@@ -1318,6 +1485,7 @@ export function StableWebRTC(opts){
         sctp_ice_state: connection.sctp_ice_state,
         connection_type: connection.current_connection_type,
         rtt: connection.current_rtt,
+        ping_rtt: connection.current_ping_rtt,
         bandwidth_outgoing: connection.current_bandwidth_outgoing,
         need_ice_restart: connection.need_ice_restart,
         ice_restart_count: connection.ice_restart_count,
@@ -1378,7 +1546,7 @@ export function StableWebRTC(opts){
     }
 
     function sctp_events(){
-      if(connection.pc && connection.pc.connectionState!=='closed'){
+      if(pc_alive()){
         if(connection.pc.sctp && connection.sctp==null){
 
           connection.sctp=connection.pc.sctp;
@@ -1423,7 +1591,7 @@ export function StableWebRTC(opts){
           try{
             if(connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport && 'onstatechange' in connection.pc.sctp.transport.iceTransport){
               connection.pc.sctp.transport.iceTransport.onstatechange=function(){
-                if(connection.pc && connection.pc.connectionState!=='closed'){
+                if(pc_alive()){
 
 
                   set_connection_state({
@@ -1443,7 +1611,7 @@ export function StableWebRTC(opts){
             if(connection.pc.sctp.transport && 'onstatechange' in connection.pc.sctp.transport){
               connection.pc.sctp.transport.onstatechange=function(){
                   
-                if(connection.pc && connection.pc.connectionState!=='closed'){
+                if(pc_alive()){
                   
                   set_connection_state({
                     sctp_dtls_state: String(connection.pc.sctp.transport.state)+""
@@ -1462,7 +1630,7 @@ export function StableWebRTC(opts){
           try{
             if('onstatechange' in connection.pc.sctp){
               connection.pc.sctp.onstatechange=function(){
-                if(connection.pc && connection.pc.connectionState!=='closed'){
+                if(pc_alive()){
 
                   set_connection_state({
                     sctp_state: String(connection.pc.sctp.state)+""
@@ -1479,17 +1647,19 @@ export function StableWebRTC(opts){
           try{
             if(connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport && 'onselectedcandidatepairchange' in connection.pc.sctp.transport.iceTransport){
               connection.pc.sctp.transport.iceTransport.onselectedcandidatepairchange=function(){
-                var selected_candidate_pair=connection.pc.sctp.transport.iceTransport.getSelectedCandidatePair();
+                if(pc_alive()){
+                  var selected_candidate_pair=connection.pc.sctp.transport.iceTransport.getSelectedCandidatePair();
 
-                set_connection_state({
-                  local_protocol: selected_candidate_pair.local.protocol,
-                  remote_protocol: selected_candidate_pair.remote.protocol
-                });
+                  set_connection_state({
+                    local_protocol: selected_candidate_pair.local.protocol,
+                    remote_protocol: selected_candidate_pair.remote.protocol
+                  });
 
-                /*
-                */
+                  /*
+                  */
 
-                connection_getstats();
+                  connection_getstats();
+                }
               };
             }
           } catch (error) {
@@ -1522,13 +1692,14 @@ export function StableWebRTC(opts){
         }
       }
 
-      if(connection.negotiation_state==2 && connection.pc.signalingState == 'have-local-offer'){
+      if(pc_alive() && connection.negotiation_state==2 && connection.pc.signalingState == 'have-local-offer'){
         if(seq_offer==connection.local_offer_history.length){
           set_connection_state({
             negotiation_state: 3
           });
 
           connection.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: sdp })).then(function(){
+            if(!pc_alive()) return;
 
             drain_pending_remote_candidates();
 
@@ -1666,12 +1837,12 @@ export function StableWebRTC(opts){
 
         function create_answer(){
           //console.log('create answer...');
-          if(connection.negotiation_state==4 && connection.pc.signalingState == 'have-remote-offer'){
+          if(pc_alive() && connection.negotiation_state==4 && connection.pc.signalingState == 'have-remote-offer'){
 
             var this_answer_for_seq=Number(connection.seq_remote_offer)+0;
 
             connection.pc.createAnswer().then(function (answer) {
-              if(connection.negotiation_state==4 && connection.pc.signalingState == 'have-remote-offer' && this_answer_for_seq==connection.seq_remote_offer){
+              if(pc_alive() && connection.negotiation_state==4 && connection.pc.signalingState == 'have-remote-offer' && this_answer_for_seq==connection.seq_remote_offer){
 
                 if('toJSON' in answer && typeof answer.toJSON=='function'){
                   var answer_json=answer.toJSON();
@@ -1682,6 +1853,7 @@ export function StableWebRTC(opts){
                 var answer_modified=remove_all_ice_candidates(answer_json.sdp);
 
                 connection.pc.setLocalDescription(new RTCSessionDescription({ type: 'answer', sdp: answer_modified })).then(function () {
+                  if(!pc_alive()) return;
 
                   if(connection.local_support_trickle_ice==null){
                     connection.local_support_trickle_ice=is_support_trickle_ice(connection.pc.localDescription.sdp);
@@ -1747,7 +1919,9 @@ export function StableWebRTC(opts){
         var this_seq_remote_offer=Number(connection.seq_remote_offer)+0;
 
         function applyRemoteOffer(){
+          if(!pc_alive()) return;
           connection.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: connection.pending_remote_offer_sdp })).then(function(){
+            if(!pc_alive()) return;
 
             drain_pending_remote_candidates();
 
@@ -2123,7 +2297,7 @@ export function StableWebRTC(opts){
     }
 
     function create_offer(){
-      if(connection.pc && connection.pc.connectionState!=='closed'){
+      if(pc_alive()){
         
         if((connection.negotiation_state==0) && (connection.pc.signalingState !== 'have-remote-offer') && (connection.making_rollback==false)){// || connection.negotiation_state==2
           
@@ -2147,7 +2321,7 @@ export function StableWebRTC(opts){
           ensure_transceivers_for_sending();
 
           connection.pc.createOffer(offer_options).then(function(offer){
-            if(connection.negotiation_state==1 && connection.pc.signalingState !== 'have-remote-offer' && this_offer_for_seq==connection.local_offer_history.length){
+            if(pc_alive() && connection.negotiation_state==1 && connection.pc.signalingState !== 'have-remote-offer' && this_offer_for_seq==connection.local_offer_history.length){
 
               if('toJSON' in offer && typeof offer.toJSON=='function'){
                 var offer_json=offer.toJSON();
@@ -2162,6 +2336,7 @@ export function StableWebRTC(opts){
               //console.log(offer_modified);
 
               connection.pc.setLocalDescription(new RTCSessionDescription({ type: 'offer', sdp: offer_modified })).then(function(){
+                if(!pc_alive()) return;
 
                 if(connection.local_support_trickle_ice==null){
                   connection.local_support_trickle_ice=is_support_trickle_ice(connection.pc.localDescription.sdp);
@@ -2529,38 +2704,72 @@ export function StableWebRTC(opts){
 
 
       }else if(type==MSGCODE_TYPE_MAP['PING']){//ping
+        // Echo the timestamp straight back as PONG. Stateless: the value is the
+        // sender's clock reading, which only the sender interprets.
+        try{
+          var pingb=litepack.decode(SCHEMA_PING,data);
+          send_signal(MSGCODE_TYPE_MAP['PONG'],litepack.encode(SCHEMA_PING,{timestamp:pingb.timestamp}));
+        }catch(error){}
+
+      }else if(type==MSGCODE_TYPE_MAP['PONG']){//pong
+        // Our own timestamp came back. rtt = now - then, measured on one clock.
+        try{
+          var pongb=litepack.decode(SCHEMA_PING,data);
+          var rtt=Date.now()-pongb.timestamp;
+          if(rtt>=0 && rtt<600000){           // sanity bound: ignore absurd values
+            // App-level RTT (full DataChannel round-trip). Kept SEPARATE from
+            // connection.current_rtt, which getStats owns and which measures the
+            // lower-level ICE/DTLS RTT. Conflating them would make either field
+            // flip between two different measurements every poll.
+            connection.current_ping_rtt=rtt;
+            ev.emit('rtt', rtt);
+          }
+        }catch(error){}
 
       }
     }
 
     function on_signal_channel(data){
 
-      // Outermost frame: kind 0 = whole envelope, kind 1 = a chunk of one.
-      var _frame=litepack.decode(SCHEMA_SIGNAL_FRAME,data);
-      var envBytes;
-      if(_frame.kind===1){
-        envBytes=reassemble_chunk(_frame.body,connection.chunk_reasm_external);
-        if(envBytes===null) return;                 // still waiting / dropped
-      }else{
-        envBytes=_frame.body;
-      }
-
-      var _env=litepack.decode(SCHEMA_SIGNAL_ENVELOPE,envBytes);
-      if(_env.checksum==murmurhash3_data(_env.payload)){
-        var _inn=litepack.decode(SCHEMA_SIGNAL_INNER,_env.payload);
-
-        if(connection.remote_nonce==0 && _inn.local_nonce>0){
-          connection.remote_nonce=_inn.local_nonce;
-        }
-
-        var sctp_not_ready=(!connection.pc || !connection.pc.sctp || !connection.pc.sctp.maxChannels || (connection.pc.sctp.maxMessageSize===Infinity) || !connection.pc.sctp.maxMessageSize);
-        if(_inn.local_nonce==connection.remote_nonce && ((_inn.remote_nonce==0 && sctp_not_ready) || _inn.remote_nonce==connection.local_nonce)){
-          process_income_signal(_inn.type,_inn.data);
+      // This is the public signal() entry point: the app feeds it whatever arrived on
+      // its own signaling transport. An escaping throw would land inside the app's
+      // WebSocket handler, so every decode below is contained.
+      try{
+        // Outermost frame: kind 0 = whole envelope, kind 1 = a chunk of one.
+        var _frame=litepack.decode(SCHEMA_SIGNAL_FRAME,data);
+        var envBytes;
+        if(_frame.kind===1){
+          envBytes=reassemble_chunk(_frame.body,connection.chunk_reasm_external);
+          if(envBytes===null) return;                 // still waiting / dropped
         }else{
-          //console.log('wrong...');
+          envBytes=_frame.body;
         }
-      }else{
-        //console.log('wrong checksum 2 !!!!......');
+
+        var _env=litepack.decode(SCHEMA_SIGNAL_ENVELOPE,envBytes);
+        if(_env.checksum==murmurhash3_data(_env.payload)){
+          var _inn=litepack.decode(SCHEMA_SIGNAL_INNER,_env.payload);
+
+          if(connection.remote_nonce==0 && _inn.local_nonce>0){
+            connection.remote_nonce=_inn.local_nonce;
+          }
+
+          var sctp_not_ready=(!connection.pc || !connection.pc.sctp || !connection.pc.sctp.maxChannels || (connection.pc.sctp.maxMessageSize===Infinity) || !connection.pc.sctp.maxMessageSize);
+          if(_inn.local_nonce==connection.remote_nonce && ((_inn.remote_nonce==0 && sctp_not_ready) || _inn.remote_nonce==connection.local_nonce)){
+            process_income_signal(_inn.type,_inn.data);
+          }else{
+            // Nonce mismatch: a frame from a stale session, or a replay. Dropping is
+            // correct — but count it, since a persistent stream of these means the peer
+            // restarted and this session should be torn down.
+            report_malformed_frame('signal/nonce', 'nonce mismatch');
+          }
+        }else{
+          // Checksum mismatch: corrupted or forged payload. Dropping is correct; there
+          // is no recovery path anyway (we can't know the type or seq to ask for a
+          // resend). The message-level timeouts will re-drive negotiation.
+          report_malformed_frame('signal/checksum', 'checksum mismatch');
+        }
+      }catch(error){
+        report_malformed_frame('signal', error);
       }
     }
 
@@ -2824,6 +3033,8 @@ export function StableWebRTC(opts){
     function remove_unused_tracks(){
       clearTimeout(connection.remove_unused_tracks_timer);
       connection.remove_unused_tracks_timer=null;
+
+      if(!pc_alive()) return;
 
       // Build set of MIDs currently in logical use
       var used = Object.create(null), k, rec;
@@ -3669,8 +3880,59 @@ export function StableWebRTC(opts){
       }
     }
 
+    // Drops queued messages that have waited longer than data_channel_max_queue_age and
+    // settles their callbacks as failed. Swept centrally from the pump rather than from a
+    // per-message timer: the pump already re-schedules itself for exactly as long as the
+    // queue is non-empty (see the tail of data_channel_pump_queue, which sits outside every
+    // guard), so it ticks every 10-60ms precisely when there is something to age out, and
+    // not at all when the queue is empty. A dedicated timer would just duplicate it.
+    //
+    // The queue is FIFO and the TTL is uniform, so it is always ordered oldest-first and
+    // everything expired is a prefix: peel from the front, stop at the first item still in
+    // date. O(expired), not O(queue).
+    //
+    // NOTE: this rides on the invariant "queue non-empty => pump scheduled". That holds
+    // today because data_channel_sending_messages_paused is never set to true. If it is
+    // ever wired up it will gate data_channel_schedule_pump — and stall this sweep with it.
+    function expire_queued_messages(){
+      var q=connection.data_channel_sending_messages_queue;
+      if(q.length==0) return;
+
+      var now=Date.now();
+      var expired=[];
+
+      while(q.length && (now-q[0].ts)>connection.data_channel_max_queue_age){
+        expired.push(q.shift());
+      }
+
+      if(expired.length==0) return;
+
+      connection.stats_dropped_expired+=expired.length;
+
+      for(var i=0;i<expired.length;i++){
+        if(typeof expired[i].callback=='function'){
+          try{
+            expired[i].callback(false);
+          }catch(cb_error){
+            ev.emit('error', cb_error);
+          }
+        }
+      }
+
+      // One report per sweep, not one per message, and rate-limited on top: under sustained
+      // congestion the pump ticks every few ms and would otherwise flood the app with events.
+      if(now-connection.last_expired_emit_ts>=1000){
+        connection.last_expired_emit_ts=now;
+        ev.emit('error','dropped '+expired.length+' queued message(s) still unsent after '+connection.data_channel_max_queue_age+'ms ('+connection.stats_dropped_expired+' total)');
+      }
+    }
+
     function data_channel_pump_queue(){
-      
+
+      // Age the queue out first, before any DC/buffer gating: a message must expire even
+      // when the channel is closed or blocked — those are exactly the cases it is stuck in.
+      expire_queued_messages();
+
       var data_channel_open=(connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
 
       if(data_channel_open==true){
@@ -3708,7 +3970,32 @@ export function StableWebRTC(opts){
                 connection.data_channel_sending_messages_queue.shift();
 
               } catch (error) {
-                ev.emit('error', error);
+                // The message is still at the head of the queue: shift() sits after send()
+                // inside this try, so a throw leaves it un-shifted, and the pump re-schedules
+                // itself at the tail of this function while the queue is non-empty. It WILL
+                // be retried on the next tick.
+                //
+                // The break is load-bearing. Every escape from this while-loop keys off a
+                // side effect of a *successful* send: the shift, the bufferedAmount growth,
+                // the sent_events growth that drives the rate limiter. A throw produces none
+                // of them, so without this break the loop re-reads the same queue[0], throws
+                // again, and spins synchronously — freezing the event loop rather than
+                // crashing it, which is far harder to diagnose.
+                //
+                // And this is a retry, not a failure — so no 'error'. Emitting one here would
+                // fire on every attempt for a message that may still go out, and the app would
+                // get an 'error' for a message that ultimately succeeded. The single authoritative
+                // failure is raised by expire_queued_messages() once the TTL lapses, together
+                // with callback(false). Until then: count it, and log it at most once a second.
+                connection.stats_send_failures++;
+
+                var fail_now=Date.now();
+                if(fail_now-connection.last_send_failure_emit_ts>=1000){
+                  connection.last_send_failure_emit_ts=fail_now;
+                  ev.emit('log','datachannel send failed, message stays queued for retry ('+connection.stats_send_failures+' total): '+((error && error.message) ? error.message : String(error)));
+                }
+
+                break;
               }
 
               if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount >= connection.data_channel_max_buffered_amount){
@@ -3755,15 +4042,18 @@ export function StableWebRTC(opts){
 
         if(max_message_size>=data.byteLength){
 
+          // ts is the enqueue time; expire_queued_messages() ages the queue out from it.
           if(typeof callback=='function'){
             connection.data_channel_sending_messages_queue.push({
               data: data,
-              callback: callback
+              callback: callback,
+              ts: Date.now()
             });
           }else{
             connection.data_channel_sending_messages_queue.push({
               data: data,
-              callback: null
+              callback: null,
+              ts: Date.now()
             });
           }
           
@@ -3778,6 +4068,12 @@ export function StableWebRTC(opts){
         }
 
       }else{
+        // Same contract as the too-big branch above: the message is not going out, so
+        // settle the callback rather than leaving the caller waiting on it forever.
+        if(typeof callback=='function'){
+          callback(false);
+        }
+
         ev.emit('error', 'no sctp yet');
       }
       
@@ -3815,6 +4111,12 @@ export function StableWebRTC(opts){
       clearTimeout(connection.mediastream_map_ack_timer);
       connection.mediastream_map_ack_timer=null;
       connection.mediastream_map_pending=null;
+
+      clearTimeout(connection.ping_timer);
+      connection.ping_timer=null;
+
+      clearTimeout(connection.liveness_timer);
+      connection.liveness_timer=null;
 
       connection.chunk_reasm_internal={};
       connection.chunk_reasm_external={};
@@ -3876,6 +4178,36 @@ export function StableWebRTC(opts){
         }
         
         connection.pc=null;
+
+        // The DC onclose handlers were nulled above, so adopt_primary_data_channel()
+        // — the only writer of data_channel_state:'closed' — will never run again.
+        // Without this, data_channel_state stays 'open' forever and the public
+        // `connected` getter keeps reporting true on a dead connection.
+        // Assigned directly (not via set_connection_state) so no statechange fires:
+        // 'close' below is the terminal event and needs no companion.
+        connection.data_channel_state='closed';
+        connection.data_channel_primary_index=null;
+        connection.sctp=null;
+        connection.list_data_channels.length=0;
+
+        // The pump timer was cleared above, so nothing will ever drain the send queue
+        // again. Anything still queued was never sent — settle its callback as failed
+        // rather than dropping it, or a caller awaiting send(data,cb) hangs forever.
+        // The queue is swapped out first so a callback that re-enters send() cannot
+        // grow the list we're iterating; each callback is isolated so a throwing one
+        // can't abort teardown or prevent 'close' below.
+        var pending=connection.data_channel_sending_messages_queue;
+        connection.data_channel_sending_messages_queue=[];
+        for(var qi=0;qi<pending.length;qi++){
+          if(typeof pending[qi].callback=='function'){
+            try{
+              pending[qi].callback(false);
+            }catch(cb_error){
+              ev.emit('error', cb_error);
+            }
+          }
+        }
+
         ev.emit('close');
       }
     }
@@ -3936,6 +4268,58 @@ export function StableWebRTC(opts){
       }
       if('gatheringMaxRetries' in opts2){
         connection.gathering_max_retries=Math.max(0,opts2.gatheringMaxRetries|0);
+      }
+
+      // Ping/pong RTT probe. ping:false disables it; pingIntervalMin/Max tune
+      // the randomised send interval (ms). Defaults: enabled, 1000–3000ms.
+      if('ping' in opts2){
+        connection.ping_enabled=(opts2.ping!==false);
+      }
+      if('pingIntervalMin' in opts2){
+        connection.ping_interval_min=Math.max(100,opts2.pingIntervalMin|0);
+      }
+      if('pingIntervalMax' in opts2){
+        connection.ping_interval_max=Math.max(connection.ping_interval_min,opts2.pingIntervalMax|0);
+      }
+
+      // Liveness watchdog. liveness:false disables it; livenessTimeout sets the
+      // no-inbound-traffic threshold (ms) before recovery/close. Default 10000.
+      if('liveness' in opts2){
+        connection.liveness_enabled=(opts2.liveness!==false);
+      }
+      if('livenessTimeout' in opts2){
+        connection.liveness_timeout_ms=Math.max(2000,opts2.livenessTimeout|0);
+      }
+
+      // Data-channel send throttling. Every one of these is read live by the
+      // send pump (data_channel_pump_queue / get_send_rate), so a change takes
+      // effect on the very next send — no reconnect needed. Defaults are
+      // conservative (64KB/s, 1000 msg/s); raise maxSendingBytesPerSec for
+      // high-rate datagram traffic.
+      if('maxSendingMessagesPerSec' in opts2){
+        connection.data_channel_max_sending_messages_per_sec=Math.max(1,opts2.maxSendingMessagesPerSec|0);
+      }
+      if('maxSendingBytesPerSec' in opts2){
+        connection.data_channel_max_sending_bytes_per_sec=Math.max(1024,opts2.maxSendingBytesPerSec|0);
+      }
+      if('minBufferedAmount' in opts2){
+        connection.data_channel_min_buffered_amount=Math.max(1024,opts2.minBufferedAmount|0);
+        // bufferedAmountLowThreshold is seeded from this at DC creation; push the
+        // new value onto already-open channels so the change isn't silently lost.
+        for(var dci=0; dci<connection.list_data_channels.length; dci++){
+          var _dc=connection.list_data_channels[dci];
+          if(_dc){ try{ _dc.bufferedAmountLowThreshold=connection.data_channel_min_buffered_amount; }catch(e){} }
+        }
+      }
+      if('maxBufferedAmount' in opts2){
+        // Must stay >= min, or the pump's two thresholds invert.
+        connection.data_channel_max_buffered_amount=Math.max(connection.data_channel_min_buffered_amount,opts2.maxBufferedAmount|0);
+      }
+      if('maxQueueAge' in opts2){
+        // How long a message may sit unsent before it is dropped and its callback failed.
+        // Floored at 1s so a misconfiguration can't expire messages faster than the pump
+        // can plausibly drain them.
+        connection.data_channel_max_queue_age=Math.max(1000,opts2.maxQueueAge|0);
       }
 
       
@@ -4045,21 +4429,46 @@ export function StableWebRTC(opts){
         };
 
         connection.pc.onicecandidateerror=function(event){
-          //console.warn('ICE candidate error', event.url, event.errorCode, event.errorText);
+          var code=Number(event.errorCode)||0;
+          var url=event.url||'unknown';
+          var text=event.errorText||'';
+          var key=url+'|'+code;
 
-          if (event.errorCode >= 300 && event.errorCode <= 699) {
-            // Here this a standardized ICE error
-            // Do something...
-            //console.log(event);
-            //send_restartIce(Number(wrtc_connection_id));
-
-          } else if (event.errorCode >= 700 && event.errorCode <= 799) {
-            // Here, the application perhaps didn't reach the server ?
-            // Do something else...
-            
-          }else{
-
+          // Fires once per failing candidate per server, so a single broken TURN can
+          // fire dozens of times per gathering pass — and again on every ICE restart.
+          // Report each (url, code) pair once; after that just count.
+          var rec=connection.ice_server_errors[key];
+          if(rec){
+            rec.count++;
+            rec.last_ts=Date.now();
+            return;
           }
+          connection.ice_server_errors[key]={
+            url:url, code:code, text:text,
+            count:1, first_ts:Date.now(), last_ts:Date.now()
+          };
+
+          var msg='ICE '+(code===701?'server unreachable':'error '+code)+' from '+url+(text?' ('+text+')':'');
+
+          // 401/403/441 = TURN rejected our credentials. 486/508 = TURN out of quota
+          // or capacity. All of these mean relay is unavailable, so any peer behind a
+          // symmetric NAT will fail to connect — the developer needs to know.
+          //
+          // Everything else is informational. In particular 701 ("couldn't reach the
+          // server") is NOT an error on its own: with several ICE servers configured,
+          // one unreachable STUN is harmless and the connection still succeeds. And
+          // 438 (Stale Nonce) is a normal part of TURN's nonce-refresh flow.
+          if(code===401 || code===403 || code===441 || code===486 || code===508){
+            ev.emit('error', msg);
+          }else{
+            ev.emit('log', msg);
+          }
+
+          // Deliberately no restartIce()/close_connection() here. This event fires per
+          // failing candidate; ICE can still succeed through a different one. Real
+          // connection failure is already handled by oniceconnectionstatechange and
+          // check_liveness — reacting here would tear down healthy connections that
+          // simply lost one relay.
         };
 
         connection.pc.oniceconnectionstatechange = function(){
@@ -4101,6 +4510,11 @@ export function StableWebRTC(opts){
             if(connection.ice_restart_count<connection.ice_restart_max_retries){
               connection.ice_restart_count++;
               restartIce();
+            }else{
+              // Exhausted — close cleanly instead of sitting in 'failed' forever.
+              ev.emit('error','ICE failed — closing after '+connection.ice_restart_max_retries+' restart attempts');
+              close_connection();
+              return;
             }
           }
 
@@ -4117,6 +4531,10 @@ export function StableWebRTC(opts){
                   if(connection.ice_restart_count<connection.ice_restart_max_retries){
                     connection.ice_restart_count++;
                     restartIce();
+                  }else{
+                    // Still disconnected and out of retries — close cleanly.
+                    ev.emit('error','ICE disconnected — closing after '+connection.ice_restart_max_retries+' restart attempts');
+                    close_connection();
                   }
                 }
               },connection.ice_restart_delay_ms);
@@ -4143,7 +4561,7 @@ export function StableWebRTC(opts){
         };
 
         connection.pc.onicegatheringstatechange=function(event){
-          if(connection.pc && connection.pc.connectionState!=='closed'){
+          if(pc_alive()){
 
             var gatherState=connection.pc.iceGatheringState;
 
@@ -4238,7 +4656,7 @@ export function StableWebRTC(opts){
           var random_delay = 8 + Math.floor(Math.random() * 55); // 8-63ms
           function try_create_dc(){
             connection.create_data_channel_timer=null;
-            if(connection.pc && connection.pc.connectionState!=='closed'){
+            if(pc_alive()){
               // SCTP "not established yet": browsers expose pc.sctp===null until a
               // data channel is negotiated; some Node bindings (webrtc-server)
               // pre-allocate the transport object, so check its state instead of
@@ -4361,4 +4779,3 @@ export function StableWebRTC(opts){
 
     return this;
   }
-  

@@ -47,13 +47,27 @@ export function reassemble_chunk(chunkBody, store, now){
       delete store[oldest];
     }
     entry = store[ch.msg_id] = { parts:new Array(ch.total), received:0, total:ch.total, ts:now };
+  } else if (entry.total !== ch.total){
+    // This chunk claims a different `total` than the one that opened the entry.
+    // The guard above only validates index against the chunk's OWN claimed total, so
+    // without this check a peer could send {total:2,index:0} then {total:99,index:50}:
+    // received would reach entry.total(2) while parts[1] is still a hole, and the
+    // assembly loop below would throw on undefined.byteLength — an unhandled throw
+    // inside an event handler, i.e. a remote-triggerable crash.
+    // Drop the chunk rather than resetting the entry: resetting would let a peer wipe
+    // an in-flight reassembly. A genuinely stale entry (uint16 msg_id wraparound)
+    // expires via the timeout sweep above.
+    return null;
   }
   entry.ts = now;
   if (!entry.parts[ch.index]){ entry.parts[ch.index]=ch.payload; entry.received++; }
 
   if (entry.received === entry.total){
     var totalLen=0, j;
-    for (j=0;j<entry.total;j++) totalLen += entry.parts[j].byteLength;
+    for (j=0;j<entry.total;j++){
+      if (!entry.parts[j]){ delete store[ch.msg_id]; return null; }   // defensive: never assemble over a hole
+      totalLen += entry.parts[j].byteLength;
+    }
     var full=new Uint8Array(totalLen), off=0;
     for (j=0;j<entry.total;j++){ full.set(entry.parts[j], off); off += entry.parts[j].byteLength; }
     delete store[ch.msg_id];

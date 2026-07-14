@@ -48,6 +48,12 @@ export var SCHEMA_TOTAL_ICE = [['total','uint16'],['ufrag','tail']];
   // Bare acknowledgement: [ seq(uint16) ]  (used by MEDIASTREAM_MAP_ACK)
 export var SCHEMA_ACK = [['seq','uint16']];
 
+  // Ping/pong RTT probe. The same schema is used for both PING and PONG:
+  // the responder echoes back the exact timestamp it received, so the original
+  // sender can compute round-trip time against its own clock (no clock sync
+  // needed). 'varint' comfortably holds a Date.now() value.
+export var SCHEMA_PING = [['timestamp','varint']];
+
   // SDP "min-viable" compact encoding for data-channel-only peers
 export var SCHEMA_SDP_MIN = [
     ['setup',          'enum',  ['actpass','active','passive']],
