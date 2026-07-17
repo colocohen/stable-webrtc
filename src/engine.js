@@ -28,7 +28,7 @@ import {
 import {
   SCHEMA_SIGNAL_ENVELOPE, SCHEMA_SIGNAL_INNER, SCHEMA_DC_MSG,
   SCHEMA_SEQ_PAYLOAD, SCHEMA_SEQ_HASH_HASH_PAYLOAD, SCHEMA_NEG_DONE,
-  SCHEMA_FAILD_DECOMPRESS, SCHEMA_TOTAL_ICE,
+  SCHEMA_FAILED_DECOMPRESS, SCHEMA_TOTAL_ICE,
   SCHEMA_SIGNAL_FRAME, SCHEMA_SIGNAL_CHUNK, SCHEMA_ACK, SCHEMA_PING
 } from './schemas.js';
 
@@ -128,7 +128,7 @@ var _TD = new TextDecoder();
 
     MEDIASTREAM_MAP: 15,
 
-    FAILD_DECOMPRESS: 16,
+    FAILED_DECOMPRESS: 16,
 
     PING: 17,
 
@@ -282,6 +282,18 @@ export function StableWebRTC(opts){
       local_nonce: (Math.floor(Math.random() * 0xFFFE) + 1),
       remote_nonce: 0,
 
+      // Remote-restart detection. remote_nonce locks on the first message and
+      // any other nonce is rejected — correct against stale/replayed frames,
+      // but a peer that RESTARTED (crash, refresh) generates a fresh nonce and
+      // would be rejected forever, leaving both sides in a zombie re-offer
+      // loop. We count consecutive rejections that carry the SAME unfamiliar
+      // nonce; a consistent streak is the signature of a restart (random junk
+      // wouldn't repeat), and at the threshold we close so the app can create
+      // a fresh instance and reconnect.
+      nonce_mismatch_streak_nonce: 0,
+      nonce_mismatch_streak_count: 0,
+      nonce_mismatch_close_threshold: 5,
+
       create_data_channel_timer: null,
 
       list_data_channels: [],
@@ -356,14 +368,41 @@ export function StableWebRTC(opts){
 
 
       data_channel_sending_messages_queue: [],
-      
+      // Head index into the queue above — QUICO's pn-history pattern: the queue
+      // is drained by ADVANCING THIS INDEX (O(1)) instead of Array.shift (O(n),
+      // which made large drains O(n²) — measured as an 8-second event-loop stall
+      // at 80K queued tiny messages). The consumed prefix is physically freed by
+      // an occasional splice once the head crosses a threshold: amortized O(1).
+      data_q_head: 0,
+      // Running sum of payload bytes currently queued (unsent) — kept in sync by
+      // push/drain/expire/close so the public bufferedAmount getter is O(1)
+      // instead of O(queue) per read.
+      data_channel_queued_bytes: 0,
+
+      // Priority lane for library signaling once the DC is open (offers, answers,
+      // candidates, ping/pong, acks). Drained by the pump BEFORE the data queue,
+      // exempt from the user rate limits and from pause(): app-data throttling
+      // must never starve the traffic that keeps the connection alive and
+      // recoverable. Entries are {data, ts} — no callbacks; stale signaling is
+      // recovered by the message-level machinery, not by the queue.
+      signal_sending_messages_queue: [],
+      signal_q_head: 0,   // head-pointer drain, same pattern as data_q_head
+
+      // pause()/resume() valve. Gates ONLY the data-lane send loop inside the
+      // pump — never the pump tick itself (the expiry sweep and the signal lane
+      // must keep running while paused).
       data_channel_sending_messages_paused: false,
 
       data_channel_min_buffered_amount: 64*1024,
       data_channel_max_buffered_amount: 1*1024*1024,
 
-      data_channel_max_sending_messages_per_sec: 1000,
-      data_channel_max_sending_bytes_per_sec: 64*1024,
+      // Rate limits are OPT-IN. Infinity (the default; users set it via 0 in
+      // options) means "no cap" — only the buffer watermarks below govern
+      // outgoing throughput. Any positive value is a hard ceiling, read live
+      // by the send pump, so it can be tuned at runtime via setConfiguration.
+      // NOTE: never apply |0 to these fields — Infinity|0 === 0.
+      data_channel_max_sending_messages_per_sec: Infinity,
+      data_channel_max_sending_bytes_per_sec: Infinity,
 
       // A queued message that still hasn't reached the wire after this long is dropped
       // and its callback settled as failed. Defaults to liveness_timeout_ms: if nothing
@@ -373,8 +412,15 @@ export function StableWebRTC(opts){
 
       data_channel_pump_queue_timer: null,
 
+      // Sliding 1s windows. Same head-pointer pattern as the queues; the sent
+      // window additionally keeps RUNNING SUMS so the rate limiter reads its
+      // totals in O(1) instead of re-summing the window per message.
       data_channel_sent_events: [],
+      sent_events_head: 0,
+      sent_window_count: 0,
+      sent_window_bytes: 0,
       data_channel_recv_events: [],
+      recv_events_head: 0,
 
       // ICE server failures, deduped by "url|errorCode" so a broken TURN can't
       // spam events: { "url|code": {url, code, text, count, first_ts, last_ts} }
@@ -387,6 +433,15 @@ export function StableWebRTC(opts){
       // Queued outbound messages dropped because they aged past data_channel_max_queue_age.
       stats_dropped_expired: 0,
       last_expired_emit_ts: 0,
+
+      // Signal-lane entries dropped by the same TTL sweep. Counted silently (no
+      // event, no callback): signaling has its own recovery paths.
+      stats_dropped_expired_signals: 0,
+
+      // Remote ICE candidates dropped by the anti-flood caps (see
+      // add_remote_candidates): a hostile peer can spam candidates, and both the
+      // dedup indexOf and the priority sort are O(n)+ per insert.
+      stats_dropped_candidates: 0,
 
       // Send attempts that threw but left the message queued for a later retry.
       stats_send_failures: 0,
@@ -455,6 +510,13 @@ export function StableWebRTC(opts){
       }
     }
 
+    // Anti-flood bounds for peer-supplied candidates. A legitimate session sees
+    // a handful of ufrags (one per ICE generation) and tens of candidates each;
+    // these caps are far above that while bounding the O(n) dedup scan, the
+    // O(n log n) priority sort, and memory against a hostile flood.
+    var MAX_REMOTE_UFRAG_BUCKETS = 8;
+    var MAX_REMOTE_CANDIDATES_PER_UFRAG = 256;
+
     function add_remote_candidates(candidate){
       if(connection.remote_support_trickle_ice==null){
         connection.remote_support_trickle_ice=true;
@@ -471,12 +533,21 @@ export function StableWebRTC(opts){
         }
       }
       if(!(of_ufrag in connection.list_remote_candidates)){
+        if(Object.keys(connection.list_remote_candidates).length>=MAX_REMOTE_UFRAG_BUCKETS){
+          connection.stats_dropped_candidates++;
+          return;
+        }
         connection.list_remote_candidates[of_ufrag]={
           total: 0,
           drained: 0,
           pending: [],
           all: [],
         };
+      }
+
+      if(connection.list_remote_candidates[of_ufrag].all.length>=MAX_REMOTE_CANDIDATES_PER_UFRAG){
+        connection.stats_dropped_candidates++;
+        return;
       }
 
       if(connection.list_remote_candidates[of_ufrag].all.indexOf(candidate.candidate)<0){
@@ -550,6 +621,32 @@ export function StableWebRTC(opts){
             data_channel_state: 'closed'
           });
 
+          // Mid-life death recovery. Startup DC creation (try_create_dc) runs once
+          // and never again, so a channel that dies later (SCTP stream reset, a
+          // binding bug) used to leave the connection with no forward path except
+          // the liveness watchdog burning through its restart budget and closing —
+          // even when ICE itself was perfectly healthy. Recreate instead.
+          // Guards: connect_time!=null proves a channel HAD opened (so this never
+          // fires during normal startup, where winner==null is routine), and we
+          // stand down if any channel is still connecting — its onopen re-runs
+          // adopt and the normal path takes over.
+          if(connection.data_channel_connect_time!=null && connection.create_data_channel_timer==null){
+            var any_still_alive=false;
+            for(var di=0; di<connection.list_data_channels.length; di++){
+              var ddc=connection.list_data_channels[di];
+              if(ddc && ddc.readyState!=='closed' && ddc.readyState!=='closing'){ any_still_alive=true; break; }
+            }
+            if(!any_still_alive){
+              connection.create_data_channel_timer=setTimeout(function(){
+                connection.create_data_channel_timer=null;
+                if(pc_alive() && connection.data_channel_primary_index==null){
+                  ev.emit('log','all data channels died while the connection is alive — recreating');
+                  create_data_channel();   // also schedules the renegotiation offer
+                }
+              }, 50);
+            }
+          }
+
         }else{
           connection.data_channel_primary_index = winner_index;
 
@@ -610,8 +707,8 @@ export function StableWebRTC(opts){
 
 
       var for_media=false;
-      for(var i in connection.created_transceivers){
-        var ctc=connection.created_transceivers[i].tc;
+      for(var ti=0; ti<connection.created_transceivers.length; ti++){
+        var ctc=connection.created_transceivers[ti].tc;
         if(ctc){
           // New transceiver without MID — needs initial negotiation
           if(!ctc.stopped && ctc.direction=='sendonly' && ctc.mid==null){
@@ -688,16 +785,18 @@ export function StableWebRTC(opts){
       ];
 
       var prev={};
-      for(var i in fields){
-        prev[fields[i]]=structuredClone(connection[fields[i]]);
+      // All tracked fields are primitives (strings/numbers/booleans/null) —
+      // plain assignment snapshots them; structuredClone was pure overhead.
+      for(var fi=0; fi<fields.length; fi++){
+        prev[fields[fi]]=connection[fields[fi]];
       }
       
       if (options && typeof options === 'object'){
 
-        for(var i in fields){
-          if(fields[i] in options){
-            if(connection[fields[i]]!==options[fields[i]]){
-              connection[fields[i]]=options[fields[i]];
+        for(var fi2=0; fi2<fields.length; fi2++){
+          if(fields[fi2] in options){
+            if(connection[fields[fi2]]!==options[fields[fi2]]){
+              connection[fields[fi2]]=options[fields[fi2]];
               has_changed=true;
             }
           }
@@ -857,9 +956,20 @@ export function StableWebRTC(opts){
           var now = Date.now();
           connection.last_recv_time = now;   // any inbound traffic proves the peer is alive
           var bytes=event.data.byteLength||event.data.length||0;
-          connection.data_channel_recv_events.push([now,bytes]);
-          while (connection.data_channel_recv_events.length && (now - connection.data_channel_recv_events[0][0]) > 1000){
-            connection.data_channel_recv_events.shift();
+          var rvs=connection.data_channel_recv_events;
+          rvs.push([now,bytes]);
+          // Head-pointer trim (no shift): the first message after a big burst
+          // used to pay O(window²) shifting the whole burst out one by one.
+          while (connection.recv_events_head < rvs.length && (now - rvs[connection.recv_events_head][0]) > 1000){
+            connection.recv_events_head++;
+          }
+          // Hard cap: an inbound flood can't grow the window without bound.
+          if (rvs.length - connection.recv_events_head > 65536){
+            connection.recv_events_head = rvs.length - 65536;
+          }
+          if (connection.recv_events_head >= 4096){
+            rvs.splice(0, connection.recv_events_head);
+            connection.recv_events_head = 0;
           }
 
           // Everything below decodes peer-supplied bytes. litepack.decode throws on
@@ -927,6 +1037,14 @@ export function StableWebRTC(opts){
       if(pc_alive()){
         try{
           
+          // Unreliable + unordered ON PURPOSE — speed over delivery guarantees;
+          // reliability, if needed, is the application's layer to add.
+          // The standard fields that actually produce this behaviour are
+          // maxRetransmits:0 (no retransmissions) and ordered:false.
+          // 'reliable' (legacy pre-standard Chrome) and 'maxMessageSize' (a
+          // read-only SCTP-negotiated value, not an RTCDataChannelInit member)
+          // are ignored by spec-compliant browsers; kept intentionally for
+          // older non-browser bindings that may still read them.
           var dc=connection.pc.createDataChannel("dc", {
             reliable:false,
             maxRetransmits:0,
@@ -1221,12 +1339,12 @@ export function StableWebRTC(opts){
 
                         // Bitrate delta
                         var now_ts=Date.now();
-                        if(srec._prev_stats_time>0 && rtp_bytes_sent>=srec._prev_video_bytes_sent){
-                          var dt=(now_ts-srec._prev_stats_time)/1000;
+                        if(srec._prev_video_stats_time>0 && rtp_bytes_sent>=srec._prev_video_bytes_sent){
+                          var dt=(now_ts-srec._prev_video_stats_time)/1000;
                           if(dt>0) srec.video_bitrate=Math.round(((rtp_bytes_sent-srec._prev_video_bytes_sent)*8)/dt);
                         }
                         srec._prev_video_bytes_sent=rtp_bytes_sent;
-                        srec._prev_stats_time=now_ts;
+                        srec._prev_video_stats_time=now_ts;
 
                       }else if(Number(obj_reports['outbound-rtp'][i].mid)==connection.list_sending_live_mediastream[tag_id].audio_mid){
 
@@ -1239,12 +1357,12 @@ export function StableWebRTC(opts){
 
                         // Bitrate delta
                         var now_ts_a=Date.now();
-                        if(srec_a._prev_stats_time>0 && rtp_bytes_sent>=srec_a._prev_audio_bytes_sent){
-                          var dt_a=(now_ts_a-srec_a._prev_stats_time)/1000;
+                        if(srec_a._prev_audio_stats_time>0 && rtp_bytes_sent>=srec_a._prev_audio_bytes_sent){
+                          var dt_a=(now_ts_a-srec_a._prev_audio_stats_time)/1000;
                           if(dt_a>0) srec_a.audio_bitrate=Math.round(((rtp_bytes_sent-srec_a._prev_audio_bytes_sent)*8)/dt_a);
                         }
                         srec_a._prev_audio_bytes_sent=rtp_bytes_sent;
-                        if(!srec_a._prev_stats_time) srec_a._prev_stats_time=now_ts_a;
+                        srec_a._prev_audio_stats_time=now_ts_a;
 
                       }
                     }
@@ -1297,12 +1415,12 @@ export function StableWebRTC(opts){
 
                         // Bitrate delta
                         var now_rv=Date.now();
-                        if(rrec._prev_stats_time>0 && rtp_bytes_recv>=rrec._prev_video_bytes_received){
-                          var dt_rv=(now_rv-rrec._prev_stats_time)/1000;
+                        if(rrec._prev_video_stats_time>0 && rtp_bytes_recv>=rrec._prev_video_bytes_received){
+                          var dt_rv=(now_rv-rrec._prev_video_stats_time)/1000;
                           if(dt_rv>0) rrec.video_bitrate=Math.round(((rtp_bytes_recv-rrec._prev_video_bytes_received)*8)/dt_rv);
                         }
                         rrec._prev_video_bytes_received=rtp_bytes_recv;
-                        rrec._prev_stats_time=now_rv;
+                        rrec._prev_video_stats_time=now_rv;
 
                         // Packet loss
                         var total_v=rtp_packets_recv+rtp_packets_lost;
@@ -1326,12 +1444,12 @@ export function StableWebRTC(opts){
 
                         // Bitrate delta
                         var now_ra=Date.now();
-                        if(rrec_a._prev_stats_time>0 && rtp_bytes_recv>=rrec_a._prev_audio_bytes_received){
-                          var dt_ra=(now_ra-rrec_a._prev_stats_time)/1000;
+                        if(rrec_a._prev_audio_stats_time>0 && rtp_bytes_recv>=rrec_a._prev_audio_bytes_received){
+                          var dt_ra=(now_ra-rrec_a._prev_audio_stats_time)/1000;
                           if(dt_ra>0) rrec_a.audio_bitrate=Math.round(((rtp_bytes_recv-rrec_a._prev_audio_bytes_received)*8)/dt_ra);
                         }
                         rrec_a._prev_audio_bytes_received=rtp_bytes_recv;
-                        if(!rrec_a._prev_stats_time) rrec_a._prev_stats_time=now_ra;
+                        rrec_a._prev_audio_stats_time=now_ra;
 
                         // Packet loss
                         var total_a=rtp_packets_recv+rtp_packets_lost;
@@ -1973,7 +2091,32 @@ export function StableWebRTC(opts){
         connection.seq_remote_offer=seq_offer;
         connection.pending_remote_offer_sdp=null;
 
-        var base_remote_polite = (connection.remote_nonce > connection.local_nonce);
+        var base_remote_polite;
+        if(connection.remote_nonce!==connection.local_nonce){
+          base_remote_polite = (connection.remote_nonce > connection.local_nonce);
+        }else{
+          // 1-in-65534 tie: both peers drew the same nonce, so nonce comparison
+          // makes BOTH impolite and glare can never resolve. Break the tie on the
+          // DTLS fingerprints — each side compares (remote_fp vs local_fp), and
+          // since the operands are swapped between the two peers, exactly one
+          // side comes out polite. Certificates are generated independently, so
+          // equal fingerprints are cryptographically impossible.
+          base_remote_polite = false;
+          var tie_remote_fp = get_fingerprint_from_sdp(sdp);
+          var tie_local_fp  = connection.local_fingerprint;
+          if(tie_local_fp==null && connection.pc && connection.pc.localDescription && connection.pc.localDescription.sdp){
+            tie_local_fp = get_fingerprint_from_sdp(connection.pc.localDescription.sdp);
+          }
+          if(tie_remote_fp && tie_local_fp){
+            for(var fb=0; fb<tie_remote_fp.length && fb<tie_local_fp.length; fb++){
+              if(tie_remote_fp[fb]!==tie_local_fp[fb]){
+                base_remote_polite = (tie_remote_fp[fb] > tie_local_fp[fb]);
+                break;
+              }
+            }
+          }
+        }
+
         var even_epoch = (connection.epoch_negotiation_success % 2) === 0;
         var polite_now = even_epoch ? base_remote_polite : !base_remote_polite;
 
@@ -2355,11 +2498,22 @@ export function StableWebRTC(opts){
 
                   var max_wait_time=7000;
 
-                  for(var i in connection.local_offer_history){
-                    if(connection.local_offer_history[i][1]>0){
-                      var time_to_get_answer=connection.local_offer_history[i][1]-connection.local_offer_history[i][0];
-                      if(time_to_get_answer+2>max_wait_time){
-                        max_wait_time=time_to_get_answer+2;
+                  // Adaptive: extend the timeout to the slowest observed answer
+                  // plus 2s of headroom, so a consistently slow signaling path
+                  // doesn't trip false rollbacks. Only the last 32 offers are
+                  // consulted — recent history reflects the current network, and
+                  // it keeps this O(1) per offer instead of O(all offers ever).
+                  // NOTE: local_offer_history itself is never trimmed — the offer
+                  // seq IS the array length (this_offer_for_seq above, and every
+                  // seq==history.length check in the answer path), so truncating
+                  // the array would corrupt sequencing. Entries are 3 numbers
+                  // each; the memory cost of keeping them all is negligible.
+                  var hist_start=Math.max(0, connection.local_offer_history.length-32);
+                  for(var hi=hist_start; hi<connection.local_offer_history.length; hi++){
+                    if(connection.local_offer_history[hi][1]>0){
+                      var time_to_get_answer=connection.local_offer_history[hi][1]-connection.local_offer_history[hi][0];
+                      if(time_to_get_answer+2000>max_wait_time){
+                        max_wait_time=time_to_get_answer+2000;
                       }
                     }
                   }
@@ -2435,9 +2589,9 @@ export function StableWebRTC(opts){
     }
 
 
-    function send_faild_decompress(type,seq){
-      var uint8buffer=litepack.encode(SCHEMA_FAILD_DECOMPRESS,{failed_type:type,seq:seq});
-      send_signal(MSGCODE_TYPE_MAP['FAILD_DECOMPRESS'],uint8buffer);
+    function send_failed_decompress(type,seq){
+      var uint8buffer=litepack.encode(SCHEMA_FAILED_DECOMPRESS,{failed_type:type,seq:seq});
+      send_signal(MSGCODE_TYPE_MAP['FAILED_DECOMPRESS'],uint8buffer);
     }
 
 
@@ -2464,14 +2618,16 @@ export function StableWebRTC(opts){
         var uint8buffer=litepack.encode(SCHEMA_DC_MSG,{type:type,data:data instanceof Uint8Array?data:toU8(data)});
         var ilimit=chunk_limit_internal();
         if(uint8buffer.byteLength<=ilimit){
-          data_channel_send(uint8buffer);                       // common case, untouched
+          data_channel_send_signal(uint8buffer);                // common case: priority lane
         }else{
           // Oversized signaling → wrap each fragment as its own DC_MSG of
           // type SIGNAL_CHUNK. App DATA never reaches here, so it's never split.
+          // All fragments enter the same priority lane back-to-back, so they are
+          // never interleaved with (or starved by) queued app data.
           var mid_i=(connection.chunk_send_id_internal=(connection.chunk_send_id_internal+1)&0xFFFF);
           var pieces_i=build_chunks(uint8buffer,ilimit,mid_i);
           for(var pi=0;pi<pieces_i.length;pi++){
-            data_channel_send(litepack.encode(SCHEMA_DC_MSG,{type:MSGCODE_TYPE_MAP['SIGNAL_CHUNK'],data:pieces_i[pi]}));
+            data_channel_send_signal(litepack.encode(SCHEMA_DC_MSG,{type:MSGCODE_TYPE_MAP['SIGNAL_CHUNK'],data:pieces_i[pi]}));
           }
         }
 
@@ -2511,11 +2667,11 @@ export function StableWebRTC(opts){
                     if(!err && murmurhash3_str(sdp)==b.result_hash){
                       process_income_offer(sdp,seq);
                     }else{
-                      send_faild_decompress(type,seq);
+                      send_failed_decompress(type,seq);
                     }
                   });
                 }else{
-                  send_faild_decompress(type,seq);
+                  send_failed_decompress(type,seq);
                 }
               });
 
@@ -2526,13 +2682,13 @@ export function StableWebRTC(opts){
                 if(!err && murmurhash3_str(sdp)==b.result_hash){
                   process_income_offer(sdp,seq);
                 }else{
-                  send_faild_decompress(type,seq);
+                  send_failed_decompress(type,seq);
                 }
               });
 
             }
           }else{
-            send_faild_decompress(type,seq);
+            send_failed_decompress(type,seq);
           }
 
         }else{
@@ -2548,7 +2704,7 @@ export function StableWebRTC(opts){
               if(result!==null){
                 process_income_offer(result,seq);
               }else{
-                send_faild_decompress(type,seq);
+                send_failed_decompress(type,seq);
               }
             });
           }
@@ -2569,11 +2725,11 @@ export function StableWebRTC(opts){
                     if(!err && murmurhash3_str(sdp)==b.result_hash){
                       process_income_answer(sdp,seq);
                     }else{
-                      send_faild_decompress(type,seq);
+                      send_failed_decompress(type,seq);
                     }
                   });
                 }else{
-                  send_faild_decompress(type,seq);
+                  send_failed_decompress(type,seq);
                 }
               });
 
@@ -2584,14 +2740,14 @@ export function StableWebRTC(opts){
                 if(!err && murmurhash3_str(sdp)==b.result_hash){
                   process_income_answer(sdp,seq);
                 }else{
-                  send_faild_decompress(type,seq);
+                  send_failed_decompress(type,seq);
                 }
               });
 
             }
 
           }else{
-            send_faild_decompress(type,seq);
+            send_failed_decompress(type,seq);
           }
 
 
@@ -2609,7 +2765,7 @@ export function StableWebRTC(opts){
               if(result!==null){
                 process_income_answer(result,seq);
               }else{
-                send_faild_decompress(type,seq);
+                send_failed_decompress(type,seq);
               }
             });
           }
@@ -2677,9 +2833,9 @@ export function StableWebRTC(opts){
           }
         }catch(error){}
 
-      }else if(type==MSGCODE_TYPE_MAP['FAILD_DECOMPRESS']){//faild_decompress
+      }else if(type==MSGCODE_TYPE_MAP['FAILED_DECOMPRESS']){//faild_decompress
 
-        var b=litepack.decode(SCHEMA_FAILD_DECOMPRESS,data);
+        var b=litepack.decode(SCHEMA_FAILED_DECOMPRESS,data);
         var seq=b.seq;
 
         if(b.failed_type>=MSGCODE_TYPE_MAP['OFFER_RAW'] && b.failed_type<=MSGCODE_TYPE_MAP['OFFER_DIFF_DEFLATE']){//send offer again...
@@ -2755,11 +2911,32 @@ export function StableWebRTC(opts){
 
           var sctp_not_ready=(!connection.pc || !connection.pc.sctp || !connection.pc.sctp.maxChannels || (connection.pc.sctp.maxMessageSize===Infinity) || !connection.pc.sctp.maxMessageSize);
           if(_inn.local_nonce==connection.remote_nonce && ((_inn.remote_nonce==0 && sctp_not_ready) || _inn.remote_nonce==connection.local_nonce)){
+            // Valid frame from the live session — any restart suspicion was noise.
+            connection.nonce_mismatch_streak_count=0;
+            connection.nonce_mismatch_streak_nonce=0;
+
             process_income_signal(_inn.type,_inn.data);
           }else{
-            // Nonce mismatch: a frame from a stale session, or a replay. Dropping is
-            // correct — but count it, since a persistent stream of these means the peer
-            // restarted and this session should be torn down.
+            // Nonce mismatch: a frame from a stale session, or a replay — dropping
+            // is correct. But if the SAME unfamiliar peer nonce keeps arriving, the
+            // peer has restarted with a fresh nonce and will never match again:
+            // close so the app can reconnect with a new instance (see the field
+            // comments on nonce_mismatch_streak_*).
+            if(_inn.local_nonce>0 && _inn.local_nonce!==connection.remote_nonce){
+              if(connection.nonce_mismatch_streak_nonce===_inn.local_nonce){
+                connection.nonce_mismatch_streak_count++;
+              }else{
+                connection.nonce_mismatch_streak_nonce=_inn.local_nonce;
+                connection.nonce_mismatch_streak_count=1;
+              }
+
+              if(connection.nonce_mismatch_streak_count>=connection.nonce_mismatch_close_threshold){
+                ev.emit('error','remote peer appears to have restarted (a new session nonce arrived '+connection.nonce_mismatch_streak_count+' times in a row) — closing this connection; create a new instance to reconnect');
+                close_connection();
+                return;
+              }
+            }
+
             report_malformed_frame('signal/nonce', 'nonce mismatch');
           }
         }else{
@@ -2844,14 +3021,15 @@ export function StableWebRTC(opts){
           audio_packet_loss: 0,
           audio_jitter: 0,
 
-          // Internal delta tracking
+          // Internal delta tracking — per-kind timestamps (see the sending record)
           _prev_video_bytes_received: 0,
           _prev_audio_bytes_received: 0,
           _prev_video_packets_lost: 0,
           _prev_video_packets_received: 0,
           _prev_audio_packets_lost: 0,
           _prev_audio_packets_received: 0,
-          _prev_stats_time: 0,
+          _prev_video_stats_time: 0,
+          _prev_audio_stats_time: 0,
         };
       }
 
@@ -2893,8 +3071,8 @@ export function StableWebRTC(opts){
           if((rec.video_track==null && options.video_track!==null) || (rec.video_track!==null && options.video_track==null) || isTrackEqual(rec.video_track, options.video_track)==false){
 
             var all_video_tracks = rec.mediastream.getVideoTracks();
-            for(var i in all_video_tracks){
-              rec.mediastream.removeTrack(all_video_tracks[i]);
+            for(var vi=0; vi<all_video_tracks.length; vi++){
+              rec.mediastream.removeTrack(all_video_tracks[vi]);
             }
 
             if(options.video_track!==null){
@@ -2910,8 +3088,8 @@ export function StableWebRTC(opts){
           if((rec.audio_track==null && options.audio_track!==null) || (rec.audio_track!==null && options.audio_track==null) || isTrackEqual(rec.audio_track, options.audio_track)==false){
 
             var all_audio_tracks = rec.mediastream.getAudioTracks();
-            for(var i in all_audio_tracks){
-              rec.mediastream.removeTrack(all_audio_tracks[i]);
+            for(var ai=0; ai<all_audio_tracks.length; ai++){
+              rec.mediastream.removeTrack(all_audio_tracks[ai]);
             }
 
             if(options.audio_track!==null){
@@ -3393,10 +3571,14 @@ export function StableWebRTC(opts){
           audio_bitrate: 0,
           audio_mime_type: null,
 
-          // Internal delta tracking
+          // Internal delta tracking — timestamps are PER KIND: video and audio
+          // stats arrive as separate reports in the same getStats pass, and a
+          // shared timestamp let whichever ran second compute its bitrate delta
+          // against the other's clock reading.
           _prev_video_bytes_sent: 0,
           _prev_audio_bytes_sent: 0,
-          _prev_stats_time: 0,
+          _prev_video_stats_time: 0,
+          _prev_audio_stats_time: 0,
 
           max_video_fps: 0,
           max_video_bitrate: 0,
@@ -3483,12 +3665,12 @@ export function StableWebRTC(opts){
 
         var all_tracks = stream.getTracks();
 
-        for(var i in all_tracks){
-          if(video_track==null && all_tracks[i].kind=='video'){
-            video_track=all_tracks[i];
+        for(var ti=0; ti<all_tracks.length; ti++){
+          if(video_track==null && all_tracks[ti].kind=='video'){
+            video_track=all_tracks[ti];
           }
-          if(audio_track==null && all_tracks[i].kind=='audio'){
-            audio_track=all_tracks[i];
+          if(audio_track==null && all_tracks[ti].kind=='audio'){
+            audio_track=all_tracks[ti];
           }
         }
 
@@ -3631,7 +3813,7 @@ export function StableWebRTC(opts){
         var current_local_ufrag=get_ufrag_from_sdp(connection.pc.localDescription.sdp);
         if(current_local_ufrag){
 
-          var candidates=connection.list_gathered_local_candidates[current_local_ufrag];
+          var candidates=connection.list_gathered_local_candidates[current_local_ufrag] || [];
           
           // --- Collection ---
           var list_ipv6 = [];
@@ -3652,8 +3834,8 @@ export function StableWebRTC(opts){
 
           var map_local_to_srflx = new Map();
 
-          for (var i in candidates) {
-            var candidate = candidates[i];
+          for (var ci=0; ci<candidates.length; ci++) {
+            var candidate = candidates[ci];
             if (!candidate) continue;
 
             var cand_str = candidate.candidate || '';
@@ -3792,118 +3974,212 @@ export function StableWebRTC(opts){
 
     
 
+    // ============================================================
+    // Head-pointer queue/window plumbing.
+    // Consuming from the FRONT of an array with shift() is O(n) per item —
+    // under load that turned every drain into O(n²) synchronous work (measured:
+    // a single 8s event-loop stall at 80K queued tiny messages). Instead, the
+    // front is consumed by advancing a head index (O(1)); identity-by-position,
+    // the same trick as QUICO's pn-history. The consumed prefix is physically
+    // freed by a splice only once the head crosses a threshold — amortized O(1)
+    // per item, and the array never holds more than (live + threshold) entries.
+    // ============================================================
+    var QUEUE_COMPACT_THRESHOLD = 4096;
+
+    // Per-tick send ceiling for BOTH pump lanes — the analogue of QUICO's
+    // max_packets_per_burst. A deliberate internal constant, not an option:
+    // it exists to bound synchronous work per event-loop turn, and dc.send is
+    // cheap enough that 512 sends stay well under a millisecond. Exceeding the
+    // ceiling just breaks the loop; the tail reschedule resumes at ~0-1ms.
+    var SENDS_MAX_PER_TICK = 512;
+
+    function data_queue_length(){
+      return connection.data_channel_sending_messages_queue.length - connection.data_q_head;
+    }
+    function signal_queue_length(){
+      return connection.signal_sending_messages_queue.length - connection.signal_q_head;
+    }
+    function compact_data_queue(){
+      if(connection.data_q_head>=QUEUE_COMPACT_THRESHOLD){
+        connection.data_channel_sending_messages_queue.splice(0, connection.data_q_head);
+        connection.data_q_head=0;
+      }
+    }
+    function compact_signal_queue(){
+      if(connection.signal_q_head>=QUEUE_COMPACT_THRESHOLD){
+        connection.signal_sending_messages_queue.splice(0, connection.signal_q_head);
+        connection.signal_q_head=0;
+      }
+    }
+
     function data_channel_get_send_rate(){
       var now = Date.now();
       var cutoff = now - 1000;
+      var evs = connection.data_channel_sent_events;
 
-      while (connection.data_channel_sent_events.length && connection.data_channel_sent_events[0][0] < cutoff){
-        connection.data_channel_sent_events.shift();
+      // Evict entries older than the window by advancing the head and
+      // decrementing the running sums — O(evicted), and reading the totals
+      // is O(1) because they're maintained incrementally at push time.
+      while (connection.sent_events_head < evs.length && evs[connection.sent_events_head][0] < cutoff){
+        connection.sent_window_bytes -= evs[connection.sent_events_head][1];
+        connection.sent_window_count--;
+        connection.sent_events_head++;
+      }
+      if (connection.sent_events_head >= QUEUE_COMPACT_THRESHOLD){
+        evs.splice(0, connection.sent_events_head);
+        connection.sent_events_head = 0;
       }
 
-      // Calculate totals
-      var sent_count = connection.data_channel_sent_events.length;
-      var sent_bytes = 0;
-      for (var i=0; i<sent_count; i++){
-        sent_bytes += connection.data_channel_sent_events[i][1];
-      }
-
-      return [sent_count,sent_bytes];
+      return [connection.sent_window_count, connection.sent_window_bytes];
     }
 
 
+    // True when at least one user rate limit is set. In unlimited mode (both
+    // Infinity — the default) the pump skips the sliding-window bookkeeping
+    // entirely, so high message rates don't pay O(window) per send for a limit
+    // nobody configured.
+    function rate_limits_active(){
+      return (connection.data_channel_max_sending_messages_per_sec!==Infinity ||
+              connection.data_channel_max_sending_bytes_per_sec!==Infinity);
+    }
+
     function data_channel_schedule_pump(){
-      if(connection.data_channel_sending_messages_paused==false){
+      // NOTE: deliberately NOT gated by data_channel_sending_messages_paused.
+      // pause() only skips the data-lane send loop inside the pump; the tick
+      // itself must keep running so the expiry sweep ages messages out and the
+      // signal lane keeps flowing. See expire_queued_messages().
+      if(connection.data_channel_pump_queue_timer!==null) return;
 
-        if(connection.data_channel_pump_queue_timer==null){
-          if(connection.data_channel_sending_messages_queue.length>0){
-            
-            var [sent_count,sent_bytes]=data_channel_get_send_rate();
+      var has_signal=signal_queue_length()>0;
+      var has_data=data_queue_length()>0;
+      if(!has_signal && !has_data) return;
 
-            var wait_time=0;
-            var now = Date.now();
+      var wait_time=0;
+      var now = Date.now();
 
-            if(sent_count>=connection.data_channel_max_sending_messages_per_sec){
+      // The user rate limits govern the data lane only. If signaling is waiting,
+      // the pump must run immediately regardless of the data budget — the signal
+      // lane ignores these limits anyway.
+      if(!has_signal && rate_limits_active()){
 
-              var oldest_ts = connection.data_channel_sent_events[0][0];
-              wait_time = Math.max(wait_time, 1000 - (now - oldest_ts));
-            }
+        var [sent_count,sent_bytes]=data_channel_get_send_rate();
 
-            if(sent_bytes>=connection.data_channel_max_sending_bytes_per_sec && sent_count > 0){
-              // now total > lim_bytes; need the front event to expire to drop below
-              // the event we wait for is data_channel_sent_events[0] .. or more:
-              // calculate forward accumulation until we drop below the limit:
-              var sumFwd = sent_bytes;
-              var j = 0;
-              while (j < sent_count && sumFwd > connection.data_channel_max_sending_bytes_per_sec){
-                sumFwd -= connection.data_channel_sent_events[j][1];
-                j++;
-              }
-              // the event to expire is the one before j (all j events will drop from window)
-              var ts_to_expire = connection.data_channel_sent_events[j-1 >= 0 ? (j-1) : 0][0];
-              var w = 1000 - (now - ts_to_expire);
-              if (w > wait_time){
-                wait_time = w;
-              }
+        if(sent_count>=connection.data_channel_max_sending_messages_per_sec){
 
-
-            }
-
-            if(wait_time<0){
-              wait_time=0;
-            }
-            if(wait_time>60){
-              wait_time=60;
-            }
-
-            if(wait_time<=0){
-              var data_channel_open=(connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
-
-              if(data_channel_open==true){
-
-                if ((connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + connection.data_channel_sending_messages_queue[0].data.byteLength) > connection.data_channel_min_buffered_amount){
-                  wait_time=10;
-                }
-
-              }else{
-                wait_time=20;
-              }
-            }
-
-            connection.data_channel_pump_queue_timer=setTimeout(function(){
-              connection.data_channel_pump_queue_timer=null;
-              data_channel_pump_queue();
-            }, wait_time);
-
-          }
+          var oldest_ts = connection.data_channel_sent_events[0][0];
+          wait_time = Math.max(wait_time, 1000 - (now - oldest_ts));
         }
 
+        if(sent_bytes>=connection.data_channel_max_sending_bytes_per_sec && sent_count > 0){
+          // now total > lim_bytes; need the front event to expire to drop below
+          // the event we wait for is data_channel_sent_events[0] .. or more:
+          // calculate forward accumulation until we drop below the limit:
+          var sumFwd = sent_bytes;
+          var j = 0;
+          while (j < sent_count && sumFwd > connection.data_channel_max_sending_bytes_per_sec){
+            sumFwd -= connection.data_channel_sent_events[j][1];
+            j++;
+          }
+          // the event to expire is the one before j (all j events will drop from window)
+          var ts_to_expire = connection.data_channel_sent_events[j-1 >= 0 ? (j-1) : 0][0];
+          var w = 1000 - (now - ts_to_expire);
+          if (w > wait_time){
+            wait_time = w;
+          }
+
+
+        }
       }
+
+      if(wait_time<0){
+        wait_time=0;
+      }
+      if(wait_time>60){
+        wait_time=60;
+      }
+
+      if(wait_time<=0){
+        var data_channel_open=(connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
+
+        if(data_channel_open==true){
+
+          // Blocked only when the next message can't fit under the HIGH watermark
+          // (max_buffered_amount); onbufferedamountlow (threshold = min) plus this
+          // 10ms poll resume the pump once SCTP drains.
+          var next_msg = has_signal
+            ? connection.signal_sending_messages_queue[connection.signal_q_head]
+            : connection.data_channel_sending_messages_queue[connection.data_q_head];
+          if ((connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + next_msg.data.byteLength) > connection.data_channel_max_buffered_amount){
+            wait_time=10;
+          }
+
+        }else{
+          wait_time=20;
+        }
+      }
+
+      // Paused with nothing but data pending: the tick only exists to age the
+      // queue out, so a slow beat is enough — no need to spin at 10-20ms.
+      if(connection.data_channel_sending_messages_paused===true && !has_signal){
+        wait_time=Math.max(wait_time,250);
+      }
+
+      connection.data_channel_pump_queue_timer=setTimeout(function(){
+        connection.data_channel_pump_queue_timer=null;
+        data_channel_pump_queue();
+      }, wait_time);
     }
 
     // Drops queued messages that have waited longer than data_channel_max_queue_age and
     // settles their callbacks as failed. Swept centrally from the pump rather than from a
-    // per-message timer: the pump already re-schedules itself for exactly as long as the
+    // per-message timer: the pump already re-schedules itself for exactly as long as any
     // queue is non-empty (see the tail of data_channel_pump_queue, which sits outside every
-    // guard), so it ticks every 10-60ms precisely when there is something to age out, and
-    // not at all when the queue is empty. A dedicated timer would just duplicate it.
+    // guard), so it ticks precisely when there is something to age out, and not at all
+    // when both queues are empty. A dedicated timer would just duplicate it.
     //
-    // The queue is FIFO and the TTL is uniform, so it is always ordered oldest-first and
+    // Each queue is FIFO and the TTL is uniform, so it is always ordered oldest-first and
     // everything expired is a prefix: peel from the front, stop at the first item still in
     // date. O(expired), not O(queue).
     //
-    // NOTE: this rides on the invariant "queue non-empty => pump scheduled". That holds
-    // today because data_channel_sending_messages_paused is never set to true. If it is
-    // ever wired up it will gate data_channel_schedule_pump — and stall this sweep with it.
-    function expire_queued_messages(){
-      var q=connection.data_channel_sending_messages_queue;
-      if(q.length==0) return;
+    // The invariant "queue non-empty => pump scheduled" survives pause(): the paused flag
+    // gates only the data-lane SEND loop, never data_channel_schedule_pump — while paused
+    // with only data pending the tick merely slows to a 250ms beat, which is plenty for
+    // aging (TTL floor is 1000ms).
+    // Per-tick expiry batch. Expiry itself is O(1) per message with the head
+    // pointer, but each expired DATA message also settles a user callback —
+    // arbitrary app code — so a mass expiry (e.g. a long pause, a dead link)
+    // is capped per tick and the remainder ages out on the following ticks.
+    var EXPIRE_MAX_PER_TICK = 4096;
 
+    function expire_queued_messages(){
       var now=Date.now();
+      var budget=EXPIRE_MAX_PER_TICK;
+
+      // Signal lane: dropped silently — no callbacks to settle and no event.
+      // A signal older than maxQueueAge is already useless (answer timeouts,
+      // FAILED_DECOMPRESS and MEDIASTREAM_MAP retransmits have long since taken
+      // over), so counting is all the observability it needs.
+      var sq=connection.signal_sending_messages_queue;
+      while(budget>0 && connection.signal_q_head<sq.length && (now-sq[connection.signal_q_head].ts)>connection.data_channel_max_queue_age){
+        connection.signal_q_head++;
+        connection.stats_dropped_expired_signals++;
+        budget--;
+      }
+      compact_signal_queue();
+
+      var q=connection.data_channel_sending_messages_queue;
+      if(data_queue_length()==0) return;
+
       var expired=[];
 
-      while(q.length && (now-q[0].ts)>connection.data_channel_max_queue_age){
-        expired.push(q.shift());
+      while(budget>0 && connection.data_q_head<q.length && (now-q[connection.data_q_head].ts)>connection.data_channel_max_queue_age){
+        var ex=q[connection.data_q_head];
+        connection.data_q_head++;
+        connection.data_channel_queued_bytes-=ex.data.byteLength;
+        expired.push(ex);
+        budget--;
       }
+      compact_data_queue();
 
       if(expired.length==0) return;
 
@@ -3929,95 +4205,210 @@ export function StableWebRTC(opts){
 
     function data_channel_pump_queue(){
 
-      // Age the queue out first, before any DC/buffer gating: a message must expire even
-      // when the channel is closed or blocked — those are exactly the cases it is stuck in.
+      // Age the queues out first, before any DC/buffer gating: a message must expire even
+      // when the channel is closed, blocked, or paused — those are exactly the cases it
+      // is stuck in.
       expire_queued_messages();
 
-      var data_channel_open=(connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
+      function primary_dc_open(){
+        return (connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
+      }
 
-      if(data_channel_open==true){
+      if(primary_dc_open()){
 
-        if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount < connection.data_channel_max_buffered_amount){
+        // ===== Signal lane — always drained FIRST =====
+        // Exempt from the user rate limits and from pause(): signaling (offers,
+        // answers, candidates, ping/pong, acks) is what keeps the connection alive
+        // and recoverable, so app-data throttling must never starve it. The only
+        // gate it respects is the SCTP buffer watermark — that one protects the
+        // transport itself.
+        var sig_sent_this_tick=0;
+        while (signal_queue_length()>0){
+
+          // Per-tick work ceiling (QUICO's max_packets_per_burst pattern): even
+          // a pathological signal flood can't hold the event loop — we break,
+          // the tail reschedules at ~0ms, and the loop breathes between bursts.
+          if(sig_sent_this_tick>=SENDS_MAX_PER_TICK) break;
+
+          if(!primary_dc_open()) break;
+
+          var sig_dc=connection.list_data_channels[connection.data_channel_primary_index];
+          var sig_data=connection.signal_sending_messages_queue[connection.signal_q_head].data;
+
+          if ((sig_dc.bufferedAmount + sig_data.byteLength) > connection.data_channel_max_buffered_amount){
+            break; // buffer full — onbufferedamountlow / the 10ms poll resumes us
+          }
+
+          try{
+            sig_dc.send(sig_data);
+            connection.signal_q_head++;      // head-pointer drain — no shift
+            sig_sent_this_tick++;
+          } catch (error) {
+            // Same retry contract as the data lane below: the message stays at the
+            // head (shift sits after send), the pump re-schedules at the tail, and
+            // the break prevents a synchronous spin on a throwing send().
+            connection.stats_send_failures++;
+
+            var sig_fail_now=Date.now();
+            if(sig_fail_now-connection.last_send_failure_emit_ts>=1000){
+              connection.last_send_failure_emit_ts=sig_fail_now;
+              ev.emit('log','datachannel send failed, message stays queued for retry ('+connection.stats_send_failures+' total): '+((error && error.message) ? error.message : String(error)));
+            }
+
+            break;
+          }
+        }
+        compact_signal_queue();
+
+        // ===== Data lane =====
+        // pause() gates ONLY this block: the expiry sweep above and the signal lane
+        // keep running, so a long pause can never stall liveness or negotiation.
+        if(connection.data_channel_sending_messages_paused===false &&
+           primary_dc_open() &&
+           connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount < connection.data_channel_max_buffered_amount){
 
           var callbacks_sent_ok=[];
+          var sent_any_data=false;
+          var data_sent_this_tick=0;
 
-          while (connection.data_channel_sending_messages_queue.length){
+          while (data_queue_length()>0){
 
-            data_channel_open=(connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
+            // Per-tick work ceiling. Without it, tiny messages against the 1MB
+            // watermark meant one tick could attempt ~80K synchronous sends —
+            // combined with shift() that was the measured 8-second stall. Now a
+            // tick does at most SENDS_MAX_PER_TICK sends and yields; the tail
+            // reschedule (~0-1ms) resumes immediately, so throughput is intact
+            // while the event loop stays responsive.
+            if(data_sent_this_tick>=SENDS_MAX_PER_TICK) break;
 
-            if(data_channel_open==true){
-              var data_to_send=connection.data_channel_sending_messages_queue[0].data;
+            if(!primary_dc_open()) break;
 
-              if ((connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + data_to_send.byteLength) > connection.data_channel_min_buffered_amount){
-                break; // wait for onbufferedamountlow event
+            var head=connection.data_channel_sending_messages_queue[connection.data_q_head];
+            var data_to_send=head.data;
+
+            // TTL guard at send time. The expiry sweep above is batch-capped
+            // (EXPIRE_MAX_PER_TICK), so under a mass expiry, messages whose TTL
+            // has already lapsed can reach this lane before the sweep gets to
+            // them — and sending one would settle its callback as SUCCESS after
+            // the contract promised failure. Drop it exactly as the sweep would.
+            if((Date.now()-head.ts) > connection.data_channel_max_queue_age){
+              connection.data_q_head++;
+              connection.data_channel_queued_bytes-=data_to_send.byteLength;
+              connection.stats_dropped_expired++;
+              if(typeof head.callback=='function'){
+                try{ head.callback(false); }catch(cb_error){ ev.emit('error', cb_error); }
               }
+              data_sent_this_tick++;   // callback work counts against the tick budget
+              continue;
+            }
 
+            // Oversize check, deferred to here so send() can queue before SCTP is
+            // negotiated (pre-connection sends). Once maxMessageSize is known, an
+            // oversized message fails immediately — with its callback settled —
+            // instead of bouncing off the transport until the TTL kills it.
+            if(connection.pc && connection.pc.sctp && connection.pc.sctp.maxMessageSize>0 && data_to_send.byteLength>connection.pc.sctp.maxMessageSize){
+              connection.data_q_head++;
+              connection.data_channel_queued_bytes-=data_to_send.byteLength;
+              if(typeof head.callback=='function'){
+                try{ head.callback(false); }catch(cb_error){ ev.emit('error', cb_error); }
+              }
+              ev.emit('error', 'message must be less than '+connection.pc.sctp.maxMessageSize+' bytes (got '+data_to_send.byteLength+')');
+              continue;
+            }
+
+            // Fill up to the HIGH watermark (max_buffered_amount). Resumption when
+            // SCTP drains back down to the LOW watermark comes from
+            // onbufferedamountlow (threshold = min_buffered_amount) plus the 10ms
+            // poll in the scheduler. Classic high/low watermark flow control:
+            // keeps the pipe full instead of capping the in-flight window at the
+            // low mark.
+            if ((connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + data_to_send.byteLength) > connection.data_channel_max_buffered_amount){
+              break; // wait for onbufferedamountlow event
+            }
+
+            if(rate_limits_active()){
               var [sent_count,sent_bytes]=data_channel_get_send_rate();
 
-              if(sent_count>connection.data_channel_max_sending_messages_per_sec || sent_bytes>connection.data_channel_max_sending_bytes_per_sec){
+              if(sent_count>=connection.data_channel_max_sending_messages_per_sec || sent_bytes>=connection.data_channel_max_sending_bytes_per_sec){
                 break;
               }
+            }
 
-              try{
-                var now=Date.now();
-                connection.list_data_channels[connection.data_channel_primary_index].send(data_to_send);
+            try{
+              var now=Date.now();
+              connection.list_data_channels[connection.data_channel_primary_index].send(data_to_send);
+              sent_any_data=true;
+              data_sent_this_tick++;
+
+              if(rate_limits_active()){
+                // The sliding window is only consulted while a limit is set;
+                // skipping the bookkeeping in unlimited mode avoids the work
+                // entirely for a limit nobody configured. Running sums make the
+                // limiter's read O(1) (see data_channel_get_send_rate).
                 connection.data_channel_sent_events.push([now,data_to_send.byteLength]);
-
-                if(connection.data_channel_sending_messages_queue[0].callback!==null){
-                  callbacks_sent_ok.push(connection.data_channel_sending_messages_queue[0].callback);
-                }
-
-                connection.data_channel_sending_messages_queue.shift();
-
-              } catch (error) {
-                // The message is still at the head of the queue: shift() sits after send()
-                // inside this try, so a throw leaves it un-shifted, and the pump re-schedules
-                // itself at the tail of this function while the queue is non-empty. It WILL
-                // be retried on the next tick.
-                //
-                // The break is load-bearing. Every escape from this while-loop keys off a
-                // side effect of a *successful* send: the shift, the bufferedAmount growth,
-                // the sent_events growth that drives the rate limiter. A throw produces none
-                // of them, so without this break the loop re-reads the same queue[0], throws
-                // again, and spins synchronously — freezing the event loop rather than
-                // crashing it, which is far harder to diagnose.
-                //
-                // And this is a retry, not a failure — so no 'error'. Emitting one here would
-                // fire on every attempt for a message that may still go out, and the app would
-                // get an 'error' for a message that ultimately succeeded. The single authoritative
-                // failure is raised by expire_queued_messages() once the TTL lapses, together
-                // with callback(false). Until then: count it, and log it at most once a second.
-                connection.stats_send_failures++;
-
-                var fail_now=Date.now();
-                if(fail_now-connection.last_send_failure_emit_ts>=1000){
-                  connection.last_send_failure_emit_ts=fail_now;
-                  ev.emit('log','datachannel send failed, message stays queued for retry ('+connection.stats_send_failures+' total): '+((error && error.message) ? error.message : String(error)));
-                }
-
-                break;
+                connection.sent_window_count++;
+                connection.sent_window_bytes+=data_to_send.byteLength;
               }
 
-              if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount >= connection.data_channel_max_buffered_amount){
-                break;
+              if(head.callback!==null){
+                callbacks_sent_ok.push(head.callback);
               }
 
-            }else{
+              connection.data_q_head++;      // head-pointer drain — no shift
+              connection.data_channel_queued_bytes-=data_to_send.byteLength;
+
+            } catch (error) {
+              // The message is still at the head of the queue: shift() sits after send()
+              // inside this try, so a throw leaves it un-shifted, and the pump re-schedules
+              // itself at the tail of this function while the queue is non-empty. It WILL
+              // be retried on the next tick.
+              //
+              // The break is load-bearing. Every escape from this while-loop keys off a
+              // side effect of a *successful* send: the shift, the bufferedAmount growth,
+              // the sent_events growth that drives the rate limiter. A throw produces none
+              // of them, so without this break the loop re-reads the same queue[0], throws
+              // again, and spins synchronously — freezing the event loop rather than
+              // crashing it, which is far harder to diagnose.
+              //
+              // And this is a retry, not a failure — so no 'error'. Emitting one here would
+              // fire on every attempt for a message that may still go out, and the app would
+              // get an 'error' for a message that ultimately succeeded. The single authoritative
+              // failure is raised by expire_queued_messages() once the TTL lapses, together
+              // with callback(false). Until then: count it, and log it at most once a second.
+              connection.stats_send_failures++;
+
+              var fail_now=Date.now();
+              if(fail_now-connection.last_send_failure_emit_ts>=1000){
+                connection.last_send_failure_emit_ts=fail_now;
+                ev.emit('log','datachannel send failed, message stays queued for retry ('+connection.stats_send_failures+' total): '+((error && error.message) ? error.message : String(error)));
+              }
+
               break;
             }
           }
 
           if(callbacks_sent_ok.length>0){
-            for(var i in callbacks_sent_ok){
-              callbacks_sent_ok[i](true);
+            // User callbacks can throw; isolate each one so a bad callback can't
+            // skip the rest or escape this timer tick as an unhandled exception.
+            for(var ci=0;ci<callbacks_sent_ok.length;ci++){
+              try{ callbacks_sent_ok[ci](true); }catch(cb_error){ ev.emit('error', cb_error); }
             }
           }
+
+          compact_data_queue();
+
+          // Everything the app queued is now on the wire (or in SCTP's buffer) —
+          // tell the producer it may write again. Emitted only on a send-driven
+          // emptying: an expiry mass-drop is a failure, not an invitation.
+          if(sent_any_data && data_queue_length()==0){
+            ev.emit('drain');
+          }
         }
-        
+
       }
 
 
-      if(connection.data_channel_sending_messages_queue.length>0){
+      if(signal_queue_length()>0 || data_queue_length()>0){
         data_channel_schedule_pump();
       }
 
@@ -4034,49 +4425,75 @@ export function StableWebRTC(opts){
         data=_TE.encode(data);
       }
 
-      if(connection.pc && connection.pc.sctp){
-        var max_message_size=900;
-        if('maxMessageSize' in connection.pc.sctp && connection.pc.sctp.maxMessageSize>0){
-          max_message_size=connection.pc.sctp.maxMessageSize;
-        }
-
-        if(max_message_size>=data.byteLength){
-
-          // ts is the enqueue time; expire_queued_messages() ages the queue out from it.
-          if(typeof callback=='function'){
-            connection.data_channel_sending_messages_queue.push({
-              data: data,
-              callback: callback,
-              ts: Date.now()
-            });
-          }else{
-            connection.data_channel_sending_messages_queue.push({
-              data: data,
-              callback: null,
-              ts: Date.now()
-            });
-          }
-          
-          data_channel_schedule_pump();
-
-        }else{
-          if(typeof callback=='function'){
-            callback(false);
-          }
-
-          ev.emit('error', 'message must be less then '+max_message_size+' bytes');
-        }
-
-      }else{
-        // Same contract as the too-big branch above: the message is not going out, so
-        // settle the callback rather than leaving the caller waiting on it forever.
+      // One contract for every "not connected yet" shape: the message is queued
+      // (with its TTL) whether SCTP exists or not. If the connection never comes
+      // up, expire_queued_messages() settles the callback as failed within
+      // maxQueueAge — same semantics as a message stuck behind a blocked channel.
+      //
+      // Size validation: if SCTP is already negotiated its maxMessageSize is
+      // known, so an oversized message fails right here. Before that the size
+      // can't be validated; the pump re-checks it the moment SCTP comes up.
+      if(connection.pc && connection.pc.sctp && connection.pc.sctp.maxMessageSize>0 && data.byteLength>connection.pc.sctp.maxMessageSize){
         if(typeof callback=='function'){
           callback(false);
         }
-
-        ev.emit('error', 'no sctp yet');
+        ev.emit('error', 'message must be less than '+connection.pc.sctp.maxMessageSize+' bytes (got '+data.byteLength+')');
+        return;
       }
-      
+
+      // ts is the enqueue time; expire_queued_messages() ages the queue out from it.
+      connection.data_channel_sending_messages_queue.push({
+        data: data,
+        callback: (typeof callback=='function') ? callback : null,
+        ts: Date.now()
+      });
+      connection.data_channel_queued_bytes+=data.byteLength;
+
+      data_channel_schedule_pump();
+    }
+
+    // Priority lane entry — used exclusively by send_signal for the internal
+    // (DataChannel) pipe. No callback and no user-visible failure: stale or
+    // undeliverable signaling is recovered by the message-level machinery
+    // (answer timeouts, FAILED_DECOMPRESS, MEDIASTREAM_MAP retransmits), never
+    // by the queue.
+    function data_channel_send_signal(data){
+      connection.signal_sending_messages_queue.push({
+        data: data,
+        ts: Date.now()
+      });
+
+      // Preempt a parked tick. The pending timer may be a data-lane wait (rate
+      // limit, up to 60ms) or the paused slow beat (250ms) — a signal must not
+      // inherit either. Rescheduling with a signal pending computes ~0ms.
+      if(connection.data_channel_pump_queue_timer!==null){
+        clearTimeout(connection.data_channel_pump_queue_timer);
+        connection.data_channel_pump_queue_timer=null;
+      }
+      data_channel_schedule_pump();
+    }
+
+    // pause()/resume(): a producer-side valve on OUTGOING APP DATA only.
+    // While paused: inbound delivery, signaling, ping/pong, the pump tick and
+    // the queue TTL all keep running, and send() keeps accepting — messages
+    // queue up and age normally (a pause longer than maxQueueAge fails them
+    // with callback(false), the uniform contract).
+    function pause_sending(){
+      connection.data_channel_sending_messages_paused=true;
+    }
+
+    function resume_sending(){
+      if(connection.data_channel_sending_messages_paused===true){
+        connection.data_channel_sending_messages_paused=false;
+
+        // A paused tick may be parked on the slow 250ms beat — kill it so
+        // sending resumes immediately rather than on the next beat.
+        if(connection.data_channel_pump_queue_timer!==null){
+          clearTimeout(connection.data_channel_pump_queue_timer);
+          connection.data_channel_pump_queue_timer=null;
+        }
+        data_channel_schedule_pump();
+      }
     }
 
 
@@ -4135,7 +4552,7 @@ export function StableWebRTC(opts){
           }
         }
 
-        for(var i in connection.list_data_channels){
+        for(var i=0; i<connection.list_data_channels.length; i++){
           if(connection.list_data_channels[i] && connection.list_data_channels[i]!==null){
             
             connection.list_data_channels[i].onopen=null;
@@ -4190,6 +4607,10 @@ export function StableWebRTC(opts){
         connection.sctp=null;
         connection.list_data_channels.length=0;
 
+        // Signal lane: no callbacks to settle — just drop whatever never went out.
+        connection.signal_sending_messages_queue.length=0;
+        connection.signal_q_head=0;
+
         // The pump timer was cleared above, so nothing will ever drain the send queue
         // again. Anything still queued was never sent — settle its callback as failed
         // rather than dropping it, or a caller awaiting send(data,cb) hangs forever.
@@ -4197,8 +4618,11 @@ export function StableWebRTC(opts){
         // grow the list we're iterating; each callback is isolated so a throwing one
         // can't abort teardown or prevent 'close' below.
         var pending=connection.data_channel_sending_messages_queue;
+        var pending_head=connection.data_q_head;
         connection.data_channel_sending_messages_queue=[];
-        for(var qi=0;qi<pending.length;qi++){
+        connection.data_q_head=0;
+        connection.data_channel_queued_bytes=0;
+        for(var qi=pending_head;qi<pending.length;qi++){
           if(typeof pending[qi].callback=='function'){
             try{
               pending[qi].callback(false);
@@ -4274,6 +4698,20 @@ export function StableWebRTC(opts){
       // the randomised send interval (ms). Defaults: enabled, 1000–3000ms.
       if('ping' in opts2){
         connection.ping_enabled=(opts2.ping!==false);
+
+        // The liveness watchdog trusts inbound traffic as proof of life, and on
+        // an otherwise-idle connection the peer's pings ARE that traffic.
+        // Disabling ping while leaving liveness on kills a perfectly healthy
+        // idle connection within ~liveness_timeout_ms × retries. So ping:false
+        // pulls liveness down with it — unless liveness is set explicitly in
+        // the same call, which wins (the 'liveness' block below runs after us).
+        if(connection.ping_enabled===false && !('liveness' in opts2) && connection.liveness_enabled===true){
+          connection.liveness_enabled=false;
+          // Deferred so a listener attached right after the constructor hears it.
+          setTimeout(function(){
+            ev.emit('log','ping disabled — liveness watchdog auto-disabled with it (idle connections would falsely time out); pass liveness:true explicitly to keep it');
+          },0);
+        }
       }
       if('pingIntervalMin' in opts2){
         connection.ping_interval_min=Math.max(100,opts2.pingIntervalMin|0);
@@ -4291,16 +4729,20 @@ export function StableWebRTC(opts){
         connection.liveness_timeout_ms=Math.max(2000,opts2.livenessTimeout|0);
       }
 
-      // Data-channel send throttling. Every one of these is read live by the
-      // send pump (data_channel_pump_queue / get_send_rate), so a change takes
-      // effect on the very next send — no reconnect needed. Defaults are
-      // conservative (64KB/s, 1000 msg/s); raise maxSendingBytesPerSec for
-      // high-rate datagram traffic.
+      // Data-channel send throttling — OPT-IN. 0 (the default) means unlimited:
+      // no rate cap, only the buffer watermarks govern outgoing throughput. Any
+      // positive value sets a hard per-second ceiling. Each limit is independent
+      // and each is read live by the send pump, so changes take effect on the
+      // very next send — no reconnect needed — including flipping between
+      // limited and unlimited at runtime. The limits govern APP DATA only;
+      // library signaling rides the priority lane and is never throttled.
+      // (|0 is applied to the user-supplied number only — never to the stored
+      // field, since Infinity|0 === 0 would silently invert "unlimited".)
       if('maxSendingMessagesPerSec' in opts2){
-        connection.data_channel_max_sending_messages_per_sec=Math.max(1,opts2.maxSendingMessagesPerSec|0);
+        connection.data_channel_max_sending_messages_per_sec=(opts2.maxSendingMessagesPerSec===0)?Infinity:Math.max(1,opts2.maxSendingMessagesPerSec|0);
       }
       if('maxSendingBytesPerSec' in opts2){
-        connection.data_channel_max_sending_bytes_per_sec=Math.max(1024,opts2.maxSendingBytesPerSec|0);
+        connection.data_channel_max_sending_bytes_per_sec=(opts2.maxSendingBytesPerSec===0)?Infinity:Math.max(1024,opts2.maxSendingBytesPerSec|0);
       }
       if('minBufferedAmount' in opts2){
         connection.data_channel_min_buffered_amount=Math.max(1024,opts2.minBufferedAmount|0);
@@ -4634,15 +5076,14 @@ export function StableWebRTC(opts){
         };
 
         connection.pc.ontrack = function(event){
-          //console.log('ccccccccccccccccc');
-          //console.log(event);
-          /*
-          var tr = e.transceiver;
-          var mid = tr && tr.mid ? tr.mid : null;
-          var logical_id = mid ? (logicalByMid[mid] || null) : null;
-          var kind = (tr && tr.receiver && tr.receiver.track) ? tr.receiver.track.kind : null;
-          try { ev.emit('newmediastream', e.streams[0], { logical_id: logical_id, mid: mid, kind: kind }); } catch(ex){}
-          */
+          // Intentionally empty. Remote track -> logical stream association is
+          // driven by the MEDIASTREAM_MAP messages (set_remote_mediastream_map /
+          // update_all_mediastream_receivers), not by ontrack: the map is the
+          // authoritative tag_id <-> MID source, while ontrack fires before the
+          // map may have arrived and carries no tag information.
+          // TODO: consider using ontrack as an early wake-up to re-run
+          // update_all_mediastream_receivers() instead of waiting for the next
+          // negotiation-state change.
         };
 
 
@@ -4696,6 +5137,8 @@ export function StableWebRTC(opts){
       removeTrack: removeTrack,
       send: data_channel_send_data,
       write: data_channel_send_data,
+      pause: pause_sending,
+      resume: resume_sending,
       set_auth_verified: set_auth_verified,
       setConfiguration: setConfiguration,
       restartIce: restartIce,
@@ -4773,6 +5216,32 @@ export function StableWebRTC(opts){
     var self = this;
     Object.defineProperty(self, 'connected', {
       get: function(){ return connection.data_channel_state==='open'; },
+      enumerable: true,
+      configurable: true
+    });
+
+    // Whether the data-lane valve is closed (see pause()/resume()).
+    Object.defineProperty(self, 'paused', {
+      get: function(){ return connection.data_channel_sending_messages_paused===true; },
+      enumerable: true,
+      configurable: true
+    });
+
+    // Producer-side backpressure signal: bytes of APP DATA accepted by send()
+    // but not yet handed to the network — the library's own queue plus whatever
+    // still sits in SCTP's buffer. Pair with the 'drain' event (fired when the
+    // queue empties via sends) to know when to stop and when to resume writing.
+    Object.defineProperty(self, 'bufferedAmount', {
+      get: function(){
+        // O(1): the queued portion is a running counter maintained by
+        // push/drain/expire/close — apps may legitimately read this per send.
+        var total=connection.data_channel_queued_bytes;
+        var pidx=connection.data_channel_primary_index;
+        if(pidx!==null && connection.list_data_channels[pidx]){
+          total+=connection.list_data_channels[pidx].bufferedAmount||0;
+        }
+        return total;
+      },
       enumerable: true,
       configurable: true
     });

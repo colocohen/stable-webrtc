@@ -39,8 +39,8 @@ export var SCHEMA_SEQ_HASH_HASH_PAYLOAD = [
   // NEGOTIATION_DONE message: [ seq(uint16) | epoch(uint16) ]
 export var SCHEMA_NEG_DONE = [['seq','uint16'],['epoch','uint16']];
 
-  // FAILD_DECOMPRESS message: [ failed_type(uint8) | seq(uint16) ]
-export var SCHEMA_FAILD_DECOMPRESS = [['failed_type','uint8'],['seq','uint16']];
+  // FAILED_DECOMPRESS message: [ failed_type(uint8) | seq(uint16) ]
+export var SCHEMA_FAILED_DECOMPRESS = [['failed_type','uint8'],['seq','uint16']];
 
   // TOTAL_ICE_CANDIDATE message: [ total(uint16) | ufrag(tail) ]
 export var SCHEMA_TOTAL_ICE = [['total','uint16'],['ufrag','tail']];
