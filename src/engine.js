@@ -315,6 +315,12 @@ export function StableWebRTC(opts){
       ice_restart_count: 0,
       ice_restart_max_retries: 5,
       ice_restart_delay_ms: 3000,
+      // Restart-budget refund requires proven stability (see the
+      // iceconnectionstatechange handler): a brief 'connected' blip on a
+      // flapping path must not refund the full retry budget, or the
+      // flap loop never exhausts and the connection zombies forever.
+      ice_restart_reset_timer: null,
+      ice_restart_stable_window_ms: 30000,
       gathering_timeout_ms: 8000,
       gathering_max_retries: 3,
       gathering_timeout_timer: null,
@@ -323,6 +329,7 @@ export function StableWebRTC(opts){
       negotiation_done_timeout_timer: null,
       
       making_rollback: false,
+      polite_defer_started: null,
 
       pending_remote_offer_sdp: null,
       sent_local_offer_sdp: null,
@@ -338,6 +345,18 @@ export function StableWebRTC(opts){
 
       // --- signaling chunking (size-based; reassembly is all-or-nothing) ---
       max_signal_chunk_size: (typeof opts.max_signal_chunk_size==='number' && opts.max_signal_chunk_size>0) ? opts.max_signal_chunk_size : 1024,
+      // Perfect-negotiation role. Apps with a known topology (client↔server,
+      // caller↔callee) should say so — it makes the polite/impolite split
+      // deterministic from t=0 with zero handshake latency:
+      //   'lead'   → impolite: offers immediately, never yields in glare
+      //   'follow' → polite: defers opening offers, yields in glare
+      //   'auto'   → (default) derive from the nonce comparison once the
+      //              first remote frame arrives; bounded-deadline fallback.
+      // Discovered the hard way: 'auto' alone is chicken-and-egg in the
+      // OPENING (politeness needs nonces, nonces ride frames, Rule A
+      // holds the frames) — both sides sat out the full deadline. An
+      // explicit role costs the app one word and removes the standoff.
+      negotiation_role: (opts.negotiationRole==='lead' || opts.negotiationRole==='follow') ? opts.negotiationRole : 'auto',
       chunk_send_id_internal: 0,      // rolling msg_id for the SCTP pipe
       chunk_send_id_external: 0,      // rolling msg_id for the emit('signal') pipe
       chunk_reasm_internal: {},       // msg_id -> partial {parts,received,total,ts}
@@ -732,6 +751,44 @@ export function StableWebRTC(opts){
         }
       }
 
+      // Also check: transceivers added DIRECTLY on the pc, outside this
+      // engine's own bookkeeping (connection.created_transceivers only
+      // holds the ones WE created). An SFU — or any consumer working at
+      // the W3C surface — legitimately calls pc.addTransceiver behind
+      // our back; negotiationneeded fired, our latch re-armed the offer,
+      // and then THIS function vetoed it because the new m-lines were
+      // invisible to the private list. Found live in M1 run 6: the
+      // condition below matched the SFU's transceivers exactly — they
+      // were just sitting in the wrong collection. Same conditions as
+      // the private-list scan, applied to the pc's full set.
+      if(!for_media && connection.pc && typeof connection.pc.getTransceivers==='function'){
+        var all_tcs=connection.pc.getTransceivers();
+        for(var ati=0; ati<all_tcs.length; ati++){
+          var atc=all_tcs[ati];
+          if(atc && !atc.stopped){
+            // Never-negotiated transceiver that wants to send. TWO shapes:
+            //  - mid==null: the browser convention (Chrome assigns mid at
+            //    setLocalDescription)
+            //  - currentDirection==null: the webrtc-server convention —
+            //    createTransceiver assigns the mid AT BIRTH, so mid is
+            //    never null and the only "never negotiated" marker is a
+            //    null currentDirection. The original mid==null-only check
+            //    structurally missed every webrtc-server transceiver
+            //    (proven live by engine-diag: is_negotiation_needed=false
+            //    with two fresh sendonly transceivers present — M1 run 8).
+            if((atc.direction=='sendonly' || atc.direction=='sendrecv') &&
+               (atc.mid==null || atc.currentDirection==null)){
+              for_media=true;
+              break;
+            }
+            if(atc.mid!==null && atc.currentDirection!==null && atc.direction!==atc.currentDirection){
+              for_media=true;
+              break;
+            }
+          }
+        }
+      }
+
       if(for_datachannel==true || for_media==true || connection.need_ice_restart==true || connection.need_reoffer==true){
         return true;
       }else{
@@ -739,22 +796,96 @@ export function StableWebRTC(opts){
       }
     }
 
+    // [engine-diag] The offer pipeline had FOUR silent dead-ends (handler
+    // drop, failure lockout, neg-state guard, needed-veto) — three were
+    // real bugs found blind. Every branch now narrates under WEBRTC_DEBUG.
+    var _engine_diag = (typeof process!=='undefined' && process.env && process.env.WEBRTC_DEBUG)
+      ? function(m){ console.log('[engine-diag] '+m); } : function(){};
+
+    /* ══════════ Deterministic politeness (perfect negotiation) ══════════
+     *
+     * WHY: with both sides symmetric, simultaneous offers (glare) resolve
+     * by rollback — and Chrome is fragile around rollbacks (SCTP wedge,
+     * extmap ghosts). Better than resolving collisions: PREVENT them.
+     *
+     * WHO IS POLITE: derived from the nonces both sides already exchange —
+     * the LOWER local_nonce is the polite side. Symmetric, deterministic,
+     * known as soon as the first remote frame arrives. Equal nonces
+     * (1/65534) → politeness stays unknown and the legacy rollback path
+     * handles any glare — a safety net, not a failure mode.
+     *
+     * RULE A (opening): while NO O/A has ever completed, the polite side
+     * defers spontaneous offers — the impolite side leads, the polite
+     * side answers. Bounded by POLITE_DEFER_MAX_MS so a dead/foreign peer
+     * can never deadlock us: past the deadline we offer anyway.
+     *
+     * RULE B (mid-session glare): an IMPOLITE side with an offer in
+     * flight IGNORES an incoming offer (the polite peer will roll back
+     * and answer ours; its change re-offers right after — its
+     * renegotiation latch guarantees the refire). The polite side keeps
+     * the legacy rollback-and-answer. The existing pending-offer timeout
+     * (max_wait_time) remains the recovery valve for all edge cases.
+     */
+    var POLITE_DEFER_MAX_MS = 2500;
+
+    function politeness(){
+      if(connection.negotiation_role==='lead'){ return false; }    // configured impolite
+      if(connection.negotiation_role==='follow'){ return true; }   // configured polite
+      if(!connection.remote_nonce){ return null; }                 // unknown yet
+      if(connection.local_nonce === connection.remote_nonce){ return null; }
+      return connection.local_nonce < connection.remote_nonce;     // true = polite
+    }
+
+    function opening_phase(){
+      // True until the FIRST O/A round has been committed on the pc.
+      if(!connection.pc){ return true; }
+      return connection.pc.currentLocalDescription==null &&
+             connection.pc.currentRemoteDescription==null;
+    }
+
     function create_offer_schedule(){
       clearTimeout(connection.create_offer_timer);
       connection.create_offer_timer=null;
 
       // Exponential backoff on consecutive failures, max 10 retries
-      if(connection.create_offer_failures>=10) return;
+      if(connection.create_offer_failures>=10){
+        _engine_diag('offer_schedule: LOCKED OUT (failures='+connection.create_offer_failures+')');
+        return;
+      }
       var base_delay = 5 + Math.floor(Math.random() * 15);
       var delay = Math.min(base_delay * Math.pow(2, connection.create_offer_failures), 5000);
+      _engine_diag('offer_schedule: armed, delay='+delay+'ms failures='+connection.create_offer_failures);
 
-      connection.create_offer_timer=setTimeout(function(){
+      connection.create_offer_timer=setTimeout(function offer_timer_body(){
         connection.create_offer_timer=null;
 
+        // RULE A — polite opening deferral. Conditions, not history: each
+        // pass re-evaluates; the moment the impolite side's offer commits
+        // (opening_phase turns false) or the deadline passes, we proceed.
+        if(opening_phase()){
+          var _pol = politeness();
+          if(_pol===true || _pol===null){
+            if(connection.polite_defer_started==null){
+              connection.polite_defer_started=Date.now();
+              _engine_diag('RULE-A: '+(_pol===true?'polite':'politeness-unknown')+
+                           ' — deferring opening offer (deadline '+POLITE_DEFER_MAX_MS+'ms)');
+            }
+            if(Date.now()-connection.polite_defer_started < POLITE_DEFER_MAX_MS){
+              connection.create_offer_timer=setTimeout(offer_timer_body, 120);
+              return;
+            }
+            _engine_diag('RULE-A: defer deadline passed — offering anyway (liveness)');
+          }
+        }
+
         if(connection.pc && (connection.negotiation_state==0)){
-          if(is_negotiation_needed()==true){
+          var _needed = is_negotiation_needed();
+          _engine_diag('offer_timer fired: neg=0, is_negotiation_needed='+_needed);
+          if(_needed==true){
             create_offer();
           }
+        }else{
+          _engine_diag('offer_timer fired: SKIPPED (pc='+(!!connection.pc)+' neg='+connection.negotiation_state+')');
         }
       }, delay);
     }
@@ -837,6 +968,16 @@ export function StableWebRTC(opts){
 
             update_all_mediastream_senders();
             update_all_mediastream_receivers();
+
+            // Re-arm renegotiation that was requested while we were busy
+            // (see pc.onnegotiationneeded latch). Condition-not-history:
+            // whatever set the latch, if we're idle and nothing is
+            // scheduled, one offer round serves all pending mutations.
+            if(connection.renegotiation_pending==true && connection.create_offer_timer==null){
+              _engine_diag('neg→0 cascade: re-arming latched renegotiation');
+              connection.renegotiation_pending=false;
+              create_offer_schedule();
+            }
 
             if(connection.pending_remote_offer_sdp!==null){
               if(connection.pc && (connection.negotiation_state==0 || connection.negotiation_state==2 || connection.negotiation_state==5)){
@@ -1033,7 +1174,10 @@ export function StableWebRTC(opts){
       }
     }
 
-    function create_data_channel(){
+    // schedule_offer (default true): pass false when calling from INSIDE
+    // create_offer() — we're already inside an offer, so the channel rides
+    // it; scheduling another would just produce a redundant renegotiation.
+    function create_data_channel(schedule_offer){
       if(pc_alive()){
         try{
           
@@ -1057,7 +1201,9 @@ export function StableWebRTC(opts){
 
           add_data_channel(dc);
 
-          create_offer_schedule();
+          if(schedule_offer!==false){
+            create_offer_schedule();
+          }
 
         } catch (error) { 
           ev.emit('error', error);
@@ -1319,7 +1465,10 @@ export function StableWebRTC(opts){
                     var rtp_bytes_sent=obj_reports['outbound-rtp'][i].bytesSent||0;
 
                     for(var tag_id in connection.list_sending_live_mediastream){
-                      if(Number(obj_reports['outbound-rtp'][i].mid)==connection.list_sending_live_mediastream[tag_id].video_mid){
+                      // a=mid is a token (RFC 5888 / RFC 4566), not a number.
+                      // Number("0av") is NaN, so any non-numeric mid would never
+                      // match and the stats below would silently stop updating.
+                      if(String(obj_reports['outbound-rtp'][i].mid)===String(connection.list_sending_live_mediastream[tag_id].video_mid)){
 
                         var srec=connection.list_sending_live_mediastream[tag_id];
                         srec.video_active=(sending_status===1);
@@ -1346,7 +1495,7 @@ export function StableWebRTC(opts){
                         srec._prev_video_bytes_sent=rtp_bytes_sent;
                         srec._prev_video_stats_time=now_ts;
 
-                      }else if(Number(obj_reports['outbound-rtp'][i].mid)==connection.list_sending_live_mediastream[tag_id].audio_mid){
+                      }else if(String(obj_reports['outbound-rtp'][i].mid)===String(connection.list_sending_live_mediastream[tag_id].audio_mid)){
 
                         var srec_a=connection.list_sending_live_mediastream[tag_id];
                         srec_a.audio_active=(sending_status===1);
@@ -1397,7 +1546,8 @@ export function StableWebRTC(opts){
                     var rtp_fps=obj_reports['inbound-rtp'][i].framesPerSecond||0;
                     
                     for(var tag_id in connection.list_receiving_live_mediastream){
-                      if(Number(obj_reports['inbound-rtp'][i].mid)==connection.list_receiving_live_mediastream[tag_id].video_mid){
+                      // See note above: mid is a token, compare as a string.
+                      if(String(obj_reports['inbound-rtp'][i].mid)===String(connection.list_receiving_live_mediastream[tag_id].video_mid)){
 
                         var rrec=connection.list_receiving_live_mediastream[tag_id];
 
@@ -1434,7 +1584,7 @@ export function StableWebRTC(opts){
                         rrec._prev_video_packets_received=rtp_packets_recv;
                         rrec._prev_video_packets_lost=rtp_packets_lost;
 
-                      }else if(Number(obj_reports['inbound-rtp'][i].mid)==connection.list_receiving_live_mediastream[tag_id].audio_mid){
+                      }else if(String(obj_reports['inbound-rtp'][i].mid)===String(connection.list_receiving_live_mediastream[tag_id].audio_mid)){
 
                         var rrec_a=connection.list_receiving_live_mediastream[tag_id];
                         if(codec_mime_type!==null) rrec_a.current_audio_mime_type=codec_mime_type;
@@ -1898,6 +2048,48 @@ export function StableWebRTC(opts){
 
           if(connection.making_rollback==false){
             connection.making_rollback=true;
+
+            // ── App-glare safety (Chrome SCTP-wedge workaround) ──
+            // Rolling back a local offer whose createDataChannel() started
+            // the SCTP transport, then answering a remote offer that also
+            // carries m=application, wedges Chrome: setLocalDescription(
+            // answer) rejects with "Failed to start SCTP transport", and
+            // every subsequent answer on this pc fails the same way — the
+            // pc is permanently unusable for data (observed live in the
+            // interop harness, immediate mode, this side polite). The
+            // never-opened channels stay bound to the aborted transport;
+            // closing them BEFORE the rollback lets the answer start SCTP
+            // cleanly as answerer, and the peer's channel (in the offer
+            // that forced this rollback) is adopted via ondatachannel.
+            // Guards keep this strictly to the pathological window: the
+            // connection never had ANY open channel, SCTP never connected,
+            // and only channels still in 'connecting' are touched — a
+            // mid-life renegotiation rollback is a no-op here. If the
+            // remote offer turns out to carry no m=application, the
+            // fresh-connection poller recreates our channel once
+            // negotiation settles back to 0 (its list-empty condition
+            // holds again) — self-healing, no starvation regression.
+            if(connection.data_channel_connect_time==null &&
+               (connection.pc.sctp==null || connection.pc.sctp.state!=='connected')){
+              var _had=connection.list_data_channels.length;
+              var _closed=0;
+              for(var _di=connection.list_data_channels.length-1; _di>=0; _di--){
+                var _dc=connection.list_data_channels[_di];
+                if(_dc && _dc.readyState==='connecting'){
+                  try{ _dc.close(); }catch(_e){}
+                  connection.list_data_channels.splice(_di,1);
+                  _closed++;
+                }
+              }
+              if(_closed>0){
+                if(connection.list_data_channels.length===0){
+                  connection.data_channel_primary_index=null;
+                }
+                ev.emit('log','app-glare rollback: closed '+_closed+'/'+_had+
+                  ' never-opened data channel(s) before rollback (Chrome SCTP-wedge workaround)');
+              }
+            }
+
             connection.pc.setLocalDescription({ type: 'rollback' }).then(function () {
               connection.making_rollback=false;
 
@@ -1945,6 +2137,22 @@ export function StableWebRTC(opts){
         // Mark as transitioning — block new offers but don't claim state 4 yet
         if(connection.negotiation_state!==0 && connection.negotiation_state!==2 && connection.negotiation_state!==5){
           return; // already handling a remote offer
+        }
+
+        // RULE B — impolite glare handling: our offer is in flight
+        // (state 2), a competing offer arrived, and we are DETERMINED
+        // impolite → drop theirs. The polite peer rolls back on
+        // receiving ours, answers it, and re-offers its own change
+        // right after (its renegotiation latch guarantees the refire).
+        // Applied only mid-session with KNOWN politeness: in the opening
+        // phase Rule A already prevents polite offers, and with unknown
+        // politeness the legacy rollback path below stays authoritative.
+        // If anything goes sideways, the pending-offer max_wait_time
+        // rollback remains the recovery valve.
+        if(connection.negotiation_state===2 && !opening_phase() && politeness()===false){
+          _engine_diag('RULE-B: impolite — ignoring incoming offer while ours is in flight (peer will rollback & answer)');
+          connection.pending_remote_offer_sdp=null;
+          return;
         }
 
         var pre_state=connection.negotiation_state;
@@ -2004,6 +2212,19 @@ export function StableWebRTC(opts){
                         negotiation_state: 0
                       });
                     });
+                  }
+
+                  // Chrome SCTP-wedge signature: once this fires, every
+                  // future answer on this pc fails identically — the pc
+                  // cannot negotiate data channels anymore. Surface it
+                  // loudly and distinctly so the app (or a future
+                  // auto-rebuild path) can recreate the peer instead of
+                  // retrying into a wall. The close-before-rollback
+                  // workaround upstream should prevent reaching here; this
+                  // is the tripwire that tells us if it ever doesn't.
+                  var _msg=(error && error.message) ? String(error.message) : String(error);
+                  if(/SCTP/i.test(_msg)){
+                    ev.emit('log','FATAL-FOR-DATA: pc SCTP transport wedged ('+_msg+') — this pc will fail all future data-channel answers; peer recreation required');
                   }
 
                   ev.emit('error', error);
@@ -2440,6 +2661,9 @@ export function StableWebRTC(opts){
     }
 
     function create_offer(){
+      _engine_diag('create_offer: alive='+pc_alive()+' neg='+connection.negotiation_state+
+                   ' sigState='+(connection.pc?connection.pc.signalingState:'-')+
+                   ' rollback='+connection.making_rollback);
       if(pc_alive()){
         
         if((connection.negotiation_state==0) && (connection.pc.signalingState !== 'have-remote-offer') && (connection.making_rollback==false)){// || connection.negotiation_state==2
@@ -2457,6 +2681,26 @@ export function StableWebRTC(opts){
           var offer_options={};
           if(connection.need_ice_restart==true){
             offer_options.iceRestart=true;
+          }
+
+          // ── Internal control channel rides the FIRST offer, whoever
+          // triggered it (restores the fix for the addStream-before-connect
+          // starvation; regressed once in a merge — observed live as
+          // "dc stayed 'new' through 98 negotiation-state transitions").
+          //
+          // The polling path (try_create_dc) requires negotiation_state==0,
+          // a window that lives 5-20ms while media negotiation churns — with
+          // media added before connect the poller starves forever and the
+          // channel is never created. Creating it HERE removes the race:
+          // no extra offer is scheduled (schedule_offer=false — we're
+          // already inside one), and media in this offer is not delayed —
+          // the m=application section simply joins it. The late-death
+          // recreate path (data_channel_connect_time gate) is a different
+          // lifecycle stage and stays as is; the two paths are complementary.
+          if(connection.pc.sctp==null || connection.pc.sctp.state!=='connected'){
+            if(connection.list_data_channels.length==0){
+              create_data_channel(false);
+            }
           }
 
           // Create transceivers for tracks that need them — ONLY here, right before createOffer.
@@ -2611,7 +2855,19 @@ export function StableWebRTC(opts){
 
     function send_signal(type,data){
 
-      var data_channel_open=(connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
+      // The DC rides the very transport that signaling sometimes needs to
+      // repair. readyState stays 'open' while ICE dies underneath it (SCTP
+      // is oblivious to the transport's health — observed live: dc=open
+      // through an entire multi-cycle ICE outage), so readyState alone must
+      // not decide the route. When ICE reports the transport down, recovery
+      // signaling MUST go external: sending the ICE-restart offer over the
+      // dead DC is asking the corpse to deliver its own cure. The external
+      // path below ('signal' event → app's WebSocket/other) exists exactly
+      // for this.
+      var ice_state=connection.pc ? connection.pc.iceConnectionState : null;
+      var transport_down=(ice_state==='disconnected' || ice_state==='failed');
+
+      var data_channel_open=(transport_down===false && connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
 
       if(data_channel_open==true){
 
@@ -4521,6 +4777,8 @@ export function StableWebRTC(opts){
 
       clearTimeout(connection.ice_restart_timer);
       connection.ice_restart_timer=null;
+      clearTimeout(connection.ice_restart_reset_timer);
+      connection.ice_restart_reset_timer=null;
 
       clearTimeout(connection.gathering_timeout_timer);
       connection.gathering_timeout_timer=null;
@@ -4925,10 +5183,27 @@ export function StableWebRTC(opts){
           }
 
           if(state=='connected' || state=='completed'){
-            // connection recovered — clear restart timer and reset count
+            // connection recovered — clear restart timer
             clearTimeout(connection.ice_restart_timer);
             connection.ice_restart_timer=null;
-            connection.ice_restart_count=0;
+
+            // Refund the restart budget only after the connection PROVES
+            // stable. The previous immediate `ice_restart_count=0` turned a
+            // flapping path (observed live: ~5s alive / ~10s dead cycles)
+            // into an infinite restart loop — every brief 'connected' blip
+            // refunded the full budget. With a stability window, a genuinely
+            // recovered link gets its budget back, while a flapping link
+            // exhausts its retries and closes cleanly with an error the app
+            // can act on.
+            clearTimeout(connection.ice_restart_reset_timer);
+            connection.ice_restart_reset_timer=setTimeout(function(){
+              connection.ice_restart_reset_timer=null;
+              if(!pc_alive()) return;
+              var s=connection.pc.iceConnectionState;
+              if(s==='connected' || s==='completed'){
+                connection.ice_restart_count=0;
+              }
+            },connection.ice_restart_stable_window_ms);
 
             // Gathering succeeded — clear gathering timeout
             clearTimeout(connection.gathering_timeout_timer);
@@ -5058,8 +5333,26 @@ export function StableWebRTC(opts){
         };
 
         connection.pc.onnegotiationneeded = function(){
+          _engine_diag('onnegotiationneeded: neg='+connection.negotiation_state+
+                       ' timer='+(connection.create_offer_timer!=null)+
+                       ' → '+((connection.negotiation_state==0 && connection.create_offer_timer==null)?'SCHEDULE':'LATCH'));
           if(connection.negotiation_state==0 && connection.create_offer_timer==null){
             create_offer_schedule();
+          }else{
+            // The event arrived mid-negotiation (we're still processing an
+            // O/A round, or an offer is already scheduled). The W3C event
+            // is edge-triggered — webrtc-server fires it once per flag
+            // transition and will NOT refire when we become idle. Dropping
+            // it here therefore deadlocked renegotiation in two verified
+            // scenarios: (1) media added during answer processing (SFU
+            // consume() reacting to signalingstatechange→stable — the
+            // browser answered our DC offer, the SFU added transceivers in
+            // the same tick, and the engine was still at negotiation_state 3),
+            // and (2) a local offer rolled back in glare — its m-lines
+            // still need negotiating but the event that announced them was
+            // consumed. Latch instead of drop; the negotiation_state==0
+            // cascade in set_connection_state re-arms the offer.
+            connection.renegotiation_pending=true;
           }
         };
 
