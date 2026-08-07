@@ -45,8 +45,16 @@ var StableWebRTCModule = (() => {
         else root.litepack = factory();
       })(typeof globalThis !== "undefined" ? globalThis : typeof self !== "undefined" ? self : exports, function() {
         "use strict";
+        var MAX_VARINT_BYTES = 8;
+        function truncErr(msg) {
+          var e = new Error(msg);
+          e.truncated = true;
+          return e;
+        }
         function writeVarint(val, buf, pos) {
-          if (typeof val !== "number" || val < 0) val = 0;
+          if (typeof val !== "number") val = 0;
+          else if (val < 0) throw new Error("litepack: varint cannot encode negative value " + val + " (use 'svarint' for signed)");
+          else if (val > 9007199254740991) throw new Error("litepack: varint value " + val + " exceeds 2^53-1 (use uint64)");
           val = Math.floor(val);
           var start = pos;
           while (val > 127) {
@@ -57,14 +65,16 @@ var StableWebRTCModule = (() => {
           return pos - start;
         }
         function readVarint(buf, pos) {
-          var val = 0, shift = 0, b, mul = 1;
+          var val = 0, n = 0, b, mul = 1;
           do {
+            if (n >= MAX_VARINT_BYTES) throw new Error("litepack: malformed varint (too long) at byte " + (pos - n));
             b = buf[pos++];
+            if (b === void 0) throw truncErr("litepack: truncated varint at byte " + (pos - 1));
             val += (b & 127) * mul;
             mul *= 128;
-            shift += 7;
+            n++;
           } while (b & 128);
-          return { value: val, bytesRead: shift / 7 };
+          return { value: val, bytesRead: n };
         }
         function varintSize(val) {
           if (typeof val !== "number" || val < 0) val = 0;
@@ -75,6 +85,12 @@ var StableWebRTCModule = (() => {
             val = Math.floor(val / 128);
           }
           return n;
+        }
+        function zigzag(v) {
+          return v >= 0 ? v * 2 : -v * 2 - 1;
+        }
+        function unzigzag(v) {
+          return v % 2 === 0 ? v / 2 : -(v + 1) / 2;
         }
         var _enc = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
         var _dec = typeof TextDecoder !== "undefined" ? new TextDecoder() : null;
@@ -99,6 +115,19 @@ var StableWebRTCModule = (() => {
             }
           }
           return new Uint8Array(arr);
+        }
+        function utf8ByteLength(str) {
+          var bytes = 0;
+          for (var i = 0; i < str.length; i++) {
+            var c = str.charCodeAt(i);
+            if (c < 128) bytes += 1;
+            else if (c < 2048) bytes += 2;
+            else if (c >= 55296 && c <= 56319 && i + 1 < str.length && str.charCodeAt(i + 1) >= 56320 && str.charCodeAt(i + 1) <= 57343) {
+              bytes += 4;
+              i++;
+            } else bytes += 3;
+          }
+          return bytes;
         }
         function utf8Decode2(buf, offset, length) {
           if (_dec) return _dec.decode(buf.subarray(offset, offset + length));
@@ -225,6 +254,51 @@ var StableWebRTCModule = (() => {
             return { value: v, bytesRead: 8 };
           }
         };
+        TYPES.int64 = {
+          size: 8,
+          write: function(v, buf, pos) {
+            var hi, lo;
+            if (typeof v === "bigint") {
+              var u = BigInt.asUintN(64, v);
+              hi = Number(u >> BigInt(32)) >>> 0;
+              lo = Number(u & BigInt(4294967295)) >>> 0;
+            } else {
+              v = v || 0;
+              lo = (v % 4294967296 + 4294967296) % 4294967296;
+              hi = Math.floor(v / 4294967296);
+              if (hi < 0) hi += 4294967296;
+            }
+            return writeI64(hi, lo, buf, pos);
+          },
+          read: function(buf, pos) {
+            var hi = (buf[pos] << 24 | buf[pos + 1] << 16 | buf[pos + 2] << 8 | buf[pos + 3]) >>> 0;
+            var lo = (buf[pos + 4] << 24 | buf[pos + 5] << 16 | buf[pos + 6] << 8 | buf[pos + 7]) >>> 0;
+            var v;
+            if (hi & 2147483648) {
+              v = -((4294967295 - hi) * 4294967296 + (4294967296 - lo));
+              if (v < -9007199254740991 && typeof BigInt !== "undefined") {
+                v = BigInt.asIntN(64, BigInt(hi) << BigInt(32) | BigInt(lo));
+              }
+            } else {
+              v = hi * 4294967296 + lo;
+              if (v > 9007199254740991 && typeof BigInt !== "undefined") {
+                v = BigInt(hi) << BigInt(32) | BigInt(lo);
+              }
+            }
+            return { value: v, bytesRead: 8 };
+          }
+        };
+        function writeI64(hi, lo, buf, pos) {
+          buf[pos] = hi >>> 24 & 255;
+          buf[pos + 1] = hi >>> 16 & 255;
+          buf[pos + 2] = hi >>> 8 & 255;
+          buf[pos + 3] = hi & 255;
+          buf[pos + 4] = lo >>> 24 & 255;
+          buf[pos + 5] = lo >>> 16 & 255;
+          buf[pos + 6] = lo >>> 8 & 255;
+          buf[pos + 7] = lo & 255;
+          return 8;
+        }
         TYPES.float32 = {
           size: 4,
           write: function(v, buf, pos) {
@@ -274,16 +348,48 @@ var StableWebRTCModule = (() => {
             return readVarint(buf, pos);
           }
         };
+        TYPES.uuid = {
+          size: 16,
+          write: function(v, buf, pos) {
+            if (v && v.length) buf.set(v.subarray ? v.subarray(0, 16) : v, pos);
+            else for (var i = 0; i < 16; i++) buf[pos + i] = 0;
+            return 16;
+          },
+          read: function(buf, pos) {
+            if (pos + 16 > buf.length) throw truncErr("litepack: truncated uuid at byte " + pos);
+            return { value: buf.subarray(pos, pos + 16), bytesRead: 16 };
+          }
+        };
+        TYPES.svarint = {
+          size: null,
+          write: function(v, buf, pos) {
+            if (typeof v !== "number") v = 0;
+            return writeVarint(zigzag(Math.round(v)), buf, pos);
+          },
+          read: function(buf, pos) {
+            var r = readVarint(buf, pos);
+            return { value: unzigzag(r.value), bytesRead: r.bytesRead };
+          }
+        };
+        var _hasEncodeInto = _enc && typeof _enc.encodeInto === "function";
         TYPES.string = {
           size: null,
           write: function(v, buf, pos) {
-            var enc = utf8Encode2(v || "");
-            var lb = writeVarint(enc.length, buf, pos);
-            buf.set(enc, pos + lb);
-            return lb + enc.length;
+            var s = v == null ? "" : String(v);
+            var len = utf8ByteLength(s);
+            var lb = writeVarint(len, buf, pos);
+            if (_hasEncodeInto) {
+              _enc.encodeInto(s, buf.subarray(pos + lb, pos + lb + len));
+            } else {
+              buf.set(utf8Encode2(s), pos + lb);
+            }
+            return lb + len;
           },
           read: function(buf, pos) {
             var l = readVarint(buf, pos);
+            if (pos + l.bytesRead + l.value > buf.length) {
+              throw truncErr("litepack: truncated string at byte " + pos + " (declared " + l.value + " bytes, " + (buf.length - pos - l.bytesRead) + " remain)");
+            }
             return { value: utf8Decode2(buf, pos + l.bytesRead, l.value), bytesRead: l.bytesRead + l.value };
           }
         };
@@ -298,6 +404,9 @@ var StableWebRTCModule = (() => {
           read: function(buf, pos) {
             var l = readVarint(buf, pos);
             var s = pos + l.bytesRead;
+            if (s + l.value > buf.length) {
+              throw truncErr("litepack: truncated bytes at byte " + pos + " (declared " + l.value + " bytes, " + (buf.length - s) + " remain)");
+            }
             return { value: buf.subarray(s, s + l.value), bytesRead: l.bytesRead + l.value };
           }
         };
@@ -320,7 +429,28 @@ var StableWebRTCModule = (() => {
         TYPES.fixed = { size: null };
         TYPES.struct = { size: null };
         TYPES.array = { size: null };
-        function compileFields(fieldDefs) {
+        var MAX_OPTIONAL_FIELDS = 52;
+        var NEEDS_DEF = { bits: 1, "enum": 1, set: 1, fixed: 1, struct: 1, array: 1, map: 1, "const": 1 };
+        var KNOWN_OPTIONS = { "default": 1 };
+        function isOptionsObject(o) {
+          var any = false;
+          for (var k in o) {
+            if (!o.hasOwnProperty(k)) continue;
+            if (!KNOWN_OPTIONS[k]) return false;
+            any = true;
+          }
+          return any;
+        }
+        function cloneDefault(v) {
+          if (Array.isArray(v)) return v.slice();
+          if (v && typeof v === "object") {
+            var o = {};
+            for (var k in v) if (v.hasOwnProperty(k)) o[k] = v[k];
+            return o;
+          }
+          return v;
+        }
+        function compileFields(fieldDefs, nested) {
           var fields = [];
           var optionalCount = 0;
           for (var i = 0; i < fieldDefs.length; i++) {
@@ -328,15 +458,53 @@ var StableWebRTCModule = (() => {
             var fname = fd[0];
             var ftype = fd[1];
             var optional = false;
+            var f0default, f0hasDefault = false;
+            if (typeof ftype !== "string") {
+              throw new Error("litepack: field '" + fname + "' \u2014 type must be a string, got " + typeof ftype);
+            }
+            if (fd.length > 2) {
+              var lastEl = fd[fd.length - 1];
+              if (lastEl && typeof lastEl === "object" && !Array.isArray(lastEl) && isOptionsObject(lastEl)) {
+                fd = fd.slice(0, -1);
+                if (lastEl.hasOwnProperty("default")) {
+                  f0default = lastEl["default"];
+                  f0hasDefault = true;
+                }
+              }
+            }
+            if (ftype === "timestamp") ftype = "varint";
+            else if (ftype === "timestamp?") ftype = "varint?";
+            else if (ftype === "uint8s") ftype = "bytes";
+            else if (ftype === "uint8s?") ftype = "bytes?";
             if (ftype.charAt(ftype.length - 1) === "?") {
               optional = true;
               ftype = ftype.substring(0, ftype.length - 1);
+            }
+            if (ftype === "tail") {
+              if (nested) {
+                throw new Error("litepack: field '" + fname + "' \u2014 'tail' is not allowed inside a nested struct or array item (no defined end); use 'bytes' (length-prefixed) instead");
+              }
+              if (i !== fieldDefs.length - 1) {
+                throw new Error("litepack: field '" + fname + "' \u2014 'tail' must be the last field in the schema");
+              }
+            }
+            if (NEEDS_DEF[ftype] && fd[2] === void 0) {
+              throw new Error("litepack: field '" + fname + "' \u2014 type '" + ftype + "' requires a definition (third element), e.g. ['" + fname + "', '" + ftype + "', ...]");
+            }
+            if (ftype === "const" && fd.length < 4) {
+              throw new Error("litepack: field '" + fname + "' \u2014 const requires a base type AND a value: ['" + fname + "', 'const', 'uint8', 64]");
+            }
+            if (ftype === "map" && typeof fd[3] !== "string") {
+              throw new Error("litepack: field '" + fname + "' \u2014 map requires key and value types: ['" + fname + "', 'map', 'string', 'varint']");
             }
             var f = {
               name: fname,
               type: ftype,
               optional,
+              hasDefault: f0hasDefault,
+              defaultValue: f0default,
               optionalIndex: optional ? optionalCount : -1,
+              optionalBit: optional ? Math.pow(2, optionalCount) : 0,
               isTail: ftype === "tail",
               bitsDef: null,
               variants: null,
@@ -344,7 +512,12 @@ var StableWebRTCModule = (() => {
               write: null,
               read: null
             };
-            if (optional) optionalCount++;
+            if (optional) {
+              optionalCount++;
+              if (optionalCount > MAX_OPTIONAL_FIELDS) {
+                throw new Error("litepack: more than " + MAX_OPTIONAL_FIELDS + " optional fields in one struct (bitmask limit) \u2014 split into nested structs");
+              }
+            }
             if (ftype === "bits" && fd[2]) {
               f.bitsDef = compileBits(fd[2]);
               f.fixedSize = f.bitsDef.totalBytes;
@@ -352,19 +525,49 @@ var StableWebRTCModule = (() => {
               f.read = createBitsReader(f.bitsDef);
             } else if (ftype === "enum" && fd[2]) {
               f.enumOpts = fd[2];
-              f.write = createEnumWriter(fd[2]);
+              f.write = createEnumWriter(fd[2], fname);
               f.read = createEnumReader(fd[2]);
             } else if (ftype === "set" && fd[2]) {
+              if (fd[2].length > MAX_SET_OPTIONS) {
+                throw new Error("litepack: field '" + fname + "' \u2014 set supports up to " + MAX_SET_OPTIONS + " options, got " + fd[2].length);
+              }
               f.setOpts = fd[2];
-              f.write = createSetWriter(fd[2]);
+              f.write = createSetWriter(fd[2], fname);
               f.read = createSetReader(fd[2]);
+            } else if (ftype === "map" && fd[2]) {
+              f.mapDef = compileMap(fd, fname);
+              f.write = createMapWriter(f.mapDef, fname);
+              f.read = createMapReader(f.mapDef);
+            } else if (ftype === "const" && fd.length >= 4) {
+              var cBase = resolveType(fd[2], fname);
+              var cVal = fd[3];
+              if (!cBase.write || !cBase.read) {
+                throw new Error("litepack: field '" + fname + "' \u2014 const base type '" + fd[2] + "' is not a simple type");
+              }
+              f.constValue = cVal;
+              f.constBaseType = fd[2];
+              f.fixedSize = cBase.size;
+              f.write = /* @__PURE__ */ (function(base, cv) {
+                return function(val, buf, pos) {
+                  return base.write(cv, buf, pos);
+                };
+              })(cBase, cVal);
+              f.read = /* @__PURE__ */ (function(base, cv, nm) {
+                return function(buf, pos) {
+                  var r = base.read(buf, pos);
+                  if (r.value !== cv) {
+                    throw new Error("litepack: field '" + nm + "' \u2014 const mismatch (expected " + JSON.stringify(cv) + ", got " + JSON.stringify(r.value) + ")");
+                  }
+                  return r;
+                };
+              })(cBase, cVal, fname);
             } else if (ftype === "fixed" && fd[2]) {
               f.fixedLen = fd[2];
               f.fixedSize = fd[2];
               f.write = createFixedWriter(fd[2]);
               f.read = createFixedReader(fd[2]);
             } else if (ftype === "struct" && fd[2]) {
-              f.structDef = compileFields(fd[2]);
+              f.structDef = compileFields(fd[2], true);
               f.write = createStructWriter(f.structDef);
               f.read = createStructReader(f.structDef);
             } else if (ftype === "array" && fd[2]) {
@@ -374,16 +577,16 @@ var StableWebRTCModule = (() => {
               f.write = createArrayWriter(arr.itemField, arr.fixedCount);
               f.read = createArrayReader(arr.itemField, arr.fixedCount);
             } else if (fd[2] && typeof fd[2] === "object" && !Array.isArray(fd[2])) {
-              var typeDef = resolveType(ftype);
+              var typeDef = resolveType(ftype, fname);
               f.write = typeDef.write;
               f.read = typeDef.read;
               f.fixedSize = typeDef.size;
               f.variants = {};
               for (var key in fd[2]) {
-                if (fd[2].hasOwnProperty(key)) f.variants[key] = compileFields(fd[2][key]);
+                if (fd[2].hasOwnProperty(key)) f.variants[key] = compileFields(fd[2][key], nested);
               }
             } else {
-              var typeDef = resolveType(ftype);
+              var typeDef = resolveType(ftype, fname);
               f.write = typeDef.write;
               f.read = typeDef.read;
               f.fixedSize = typeDef.size;
@@ -392,24 +595,28 @@ var StableWebRTCModule = (() => {
           }
           return { fields, optionalCount };
         }
-        function resolveType(name) {
+        function resolveType(name, fieldName) {
           var t = TYPES[name];
           if (t) return t;
           var codec2 = _codecs[name];
           if (codec2) return codec2;
-          throw new Error("litepack: unknown type '" + name + "'");
+          throw new Error("litepack: unknown type '" + name + "'" + (fieldName ? " for field '" + fieldName + "'" : "") + " \u2014 known types: " + Object.keys(TYPES).join(", "));
         }
         function compileBits(bitsDef) {
           var subFields = [];
           var totalBits = 0;
           for (var i = 0; i < bitsDef.length; i++) {
-            subFields.push({ name: bitsDef[i][0], width: bitsDef[i][1] });
-            totalBits += bitsDef[i][1];
+            var w = bitsDef[i][1];
+            if (typeof w !== "number" || w < 1 || w > 32) {
+              throw new Error("litepack: bits field '" + bitsDef[i][0] + "' has invalid width " + w + " (must be 1-32)");
+            }
+            subFields.push({ name: bitsDef[i][0], width: w });
+            totalBits += w;
           }
           return { subFields, totalBits, totalBytes: Math.ceil(totalBits / 8) };
         }
         function createBitsWriter(def) {
-          return function(val, buf, pos) {
+          if (def.totalBits <= 31) return function(val, buf, pos) {
             var packed = 0;
             for (var i = 0; i < def.subFields.length; i++) {
               var sf = def.subFields[i];
@@ -422,9 +629,24 @@ var StableWebRTCModule = (() => {
             }
             return def.totalBytes;
           };
+          return function(val, buf, pos) {
+            for (var b = 0; b < def.totalBytes; b++) buf[pos + b] = 0;
+            var bitPos = 0;
+            for (var i = 0; i < def.subFields.length; i++) {
+              var sf = def.subFields[i];
+              var v = (val && val[sf.name] || 0) >>> 0;
+              for (var w = sf.width - 1; w >= 0; w--) {
+                if ((w < 31 ? v >>> w : Math.floor(v / 2147483648)) & 1) {
+                  buf[pos + (bitPos >> 3)] |= 128 >> (bitPos & 7);
+                }
+                bitPos++;
+              }
+            }
+            return def.totalBytes;
+          };
         }
         function createBitsReader(def) {
-          return function(buf, pos) {
+          if (def.totalBits <= 31) return function(buf, pos) {
             var packed = 0;
             for (var b = 0; b < def.totalBytes; b++) packed = packed << 8 | buf[pos + b];
             var result = {};
@@ -436,11 +658,36 @@ var StableWebRTCModule = (() => {
             }
             return { value: result, bytesRead: def.totalBytes };
           };
+          return function(buf, pos) {
+            var result = {};
+            var bitPos = 0;
+            for (var i = 0; i < def.subFields.length; i++) {
+              var sf = def.subFields[i];
+              var v = 0;
+              for (var w = 0; w < sf.width; w++) {
+                v = v * 2 + (buf[pos + (bitPos >> 3)] >> 7 - (bitPos & 7) & 1);
+                bitPos++;
+              }
+              result[sf.name] = v;
+            }
+            return { value: result, bytesRead: def.totalBytes };
+          };
         }
-        function createEnumWriter(opts) {
+        function buildIndexMap(opts) {
+          var m = {};
+          for (var i = 0; i < opts.length; i++) m[opts[i]] = i;
+          return m;
+        }
+        function createEnumWriter(opts, fieldName) {
+          var idxMap = buildIndexMap(opts);
           return function(val, buf, pos) {
-            var idx = opts.indexOf(val);
-            return writeVarint(idx === -1 ? 0 : idx, buf, pos);
+            var idx = idxMap[val] !== void 0 ? idxMap[val] : -1;
+            if (idx === -1) {
+              if (typeof val === "number" && val >= 0) return writeVarint(val, buf, pos);
+              if (val === void 0 || val === null) return writeVarint(0, buf, pos);
+              throw new Error("litepack: field '" + fieldName + "' \u2014 unknown enum value " + JSON.stringify(val) + " (options: " + opts.join(", ") + ")");
+            }
+            return writeVarint(idx, buf, pos);
           };
         }
         function createEnumReader(opts) {
@@ -449,13 +696,19 @@ var StableWebRTCModule = (() => {
             return { value: r.value < opts.length ? opts[r.value] : r.value, bytesRead: r.bytesRead };
           };
         }
-        function createSetWriter(opts) {
+        var MAX_SET_OPTIONS = 52;
+        function createSetWriter(opts, fieldName) {
+          var idxMap = buildIndexMap(opts);
           return function(val, buf, pos) {
             var mask = 0;
             if (val) {
               for (var i = 0; i < val.length; i++) {
-                var idx = opts.indexOf(val[i]);
-                if (idx !== -1) mask |= 1 << idx;
+                var idx = idxMap[val[i]] !== void 0 ? idxMap[val[i]] : -1;
+                if (idx === -1) {
+                  throw new Error("litepack: field '" + fieldName + "' \u2014 unknown set value " + JSON.stringify(val[i]) + " (options: " + opts.join(", ") + ")");
+                }
+                var bit = Math.pow(2, idx);
+                if (Math.floor(mask / bit) % 2 === 0) mask += bit;
               }
             }
             return writeVarint(mask, buf, pos);
@@ -465,8 +718,10 @@ var StableWebRTCModule = (() => {
           return function(buf, pos) {
             var r = readVarint(buf, pos);
             var arr = [];
-            for (var i = 0; i < opts.length; i++) {
-              if (r.value & 1 << i) arr.push(opts[i]);
+            var mask = r.value;
+            for (var i = 0; i < opts.length && mask > 0; i++) {
+              if (mask % 2 === 1) arr.push(opts[i]);
+              mask = Math.floor(mask / 2);
             }
             return { value: arr, bytesRead: r.bytesRead };
           };
@@ -479,8 +734,72 @@ var StableWebRTCModule = (() => {
             return len;
           };
         }
+        function compileMap(fd, fname) {
+          var keyType = fd[2];
+          var valType = fd[3];
+          var def = { keyField: makeSimpleField(keyType, fname + ".<key>"), numericKeys: keyType !== "string" };
+          if (valType === "struct") {
+            if (!Array.isArray(fd[4])) {
+              throw new Error("litepack: field '" + fname + "' \u2014 map with struct values needs a schema: ['" + fname + "', 'map', '" + keyType + "', 'struct', [...]]");
+            }
+            var sd = compileFields(fd[4], true);
+            def.valField = {
+              type: "struct",
+              fixedSize: null,
+              structDef: sd,
+              write: createStructWriter(sd),
+              read: createStructReader(sd)
+            };
+          } else {
+            def.valField = makeSimpleField(valType, fname + ".<value>");
+          }
+          return def;
+        }
+        function makeSimpleField(typeName, ctx) {
+          if (typeName === "array" || typeName === "map" || typeName === "bits" || typeName === "tail" || typeName === "const" || typeName === "fixed") {
+            throw new Error("litepack: '" + typeName + "' is not supported here (" + ctx + ") \u2014 wrap it in a struct");
+          }
+          var t = resolveType(typeName, ctx);
+          return { type: typeName, fixedSize: t.size, write: t.write, read: t.read };
+        }
+        function createMapWriter(def, fieldName) {
+          return function(val, buf, pos) {
+            var keys = val ? Object.keys(val) : [];
+            var start = pos;
+            pos += writeVarint(keys.length, buf, pos);
+            for (var i = 0; i < keys.length; i++) {
+              var k = def.numericKeys ? Number(keys[i]) : keys[i];
+              pos += def.keyField.write(k, buf, pos);
+              pos += def.valField.write(val[keys[i]], buf, pos);
+            }
+            return pos - start;
+          };
+        }
+        function createMapReader(def) {
+          var minPair = (def.keyField.fixedSize || 1) + (def.valField.fixedSize || 1);
+          return function(buf, pos) {
+            var start = pos;
+            var cr = readVarint(buf, pos);
+            pos += cr.bytesRead;
+            if (cr.value * minPair > buf.length - pos) {
+              throw truncErr("litepack: map at byte " + start + " needs more bytes (count " + cr.value + ", " + (buf.length - pos) + " remain)");
+            }
+            var out = {};
+            for (var i = 0; i < cr.value; i++) {
+              var kr = def.keyField.read(buf, pos);
+              pos += kr.bytesRead;
+              var vr = def.valField.read(buf, pos);
+              pos += vr.bytesRead;
+              out[kr.value] = vr.value;
+            }
+            return { value: out, bytesRead: pos - start };
+          };
+        }
         function createFixedReader(len) {
           return function(buf, pos) {
+            if (pos + len > buf.length) {
+              throw truncErr("litepack: truncated fixed(" + len + ") at byte " + pos);
+            }
             return { value: buf.subarray(pos, pos + len), bytesRead: len };
           };
         }
@@ -499,24 +818,31 @@ var StableWebRTCModule = (() => {
             return { value: data, bytesRead: pos - start };
           };
         }
+        var UNSUPPORTED_ARRAY_ITEM = { array: 1, map: 1, bits: 1, fixed: 1, tail: 1, "const": 1 };
         function compileArrayItem(fd) {
           var itemType = fd[2];
+          if (typeof itemType !== "string") {
+            throw new Error("litepack: field '" + fd[0] + "' \u2014 array requires an item type, e.g. ['" + fd[0] + "', 'array', 'uint16']");
+          }
+          if (UNSUPPORTED_ARRAY_ITEM[itemType]) {
+            throw new Error("litepack: field '" + fd[0] + "' \u2014 '" + itemType + "' is not supported directly as an array item; wrap it in a struct, e.g. ['" + fd[0] + "', 'array', 'struct', [['inner', '" + itemType + "', ...]]]");
+          }
           var itemField = { type: itemType, fixedSize: null };
           var nextIdx = 3;
           var fixedCount = null;
           if (itemType === "struct" && Array.isArray(fd[nextIdx])) {
-            itemField.structDef = compileFields(fd[nextIdx]);
+            itemField.structDef = compileFields(fd[nextIdx], true);
             itemField.write = createStructWriter(itemField.structDef);
             itemField.read = createStructReader(itemField.structDef);
             nextIdx++;
           } else if (itemType === "enum" && Array.isArray(fd[nextIdx])) {
             itemField.enumOpts = fd[nextIdx];
-            itemField.write = createEnumWriter(fd[nextIdx]);
+            itemField.write = createEnumWriter(fd[nextIdx], fd[0]);
             itemField.read = createEnumReader(fd[nextIdx]);
             nextIdx++;
           } else if (itemType === "set" && Array.isArray(fd[nextIdx])) {
             itemField.setOpts = fd[nextIdx];
-            itemField.write = createSetWriter(fd[nextIdx]);
+            itemField.write = createSetWriter(fd[nextIdx], fd[0]);
             itemField.read = createSetReader(fd[nextIdx]);
             nextIdx++;
           } else if (itemType === "bits" && Array.isArray(fd[nextIdx])) {
@@ -533,7 +859,7 @@ var StableWebRTCModule = (() => {
             itemField.read = createFixedReader(fd[nextIdx]);
             nextIdx++;
           } else {
-            var t = resolveType(itemType);
+            var t = resolveType(itemType, fd[0]);
             itemField.write = t.write;
             itemField.read = t.read;
             itemField.fixedSize = t.size;
@@ -554,6 +880,7 @@ var StableWebRTCModule = (() => {
           };
         }
         function createArrayReader(itemField, fixedCount) {
+          var minItemSize = itemField.fixedSize || 1;
           return function(buf, pos) {
             var start = pos;
             var count;
@@ -563,6 +890,9 @@ var StableWebRTCModule = (() => {
               var cr = readVarint(buf, pos);
               count = cr.value;
               pos += cr.bytesRead;
+            }
+            if (count * minItemSize > buf.length - pos) {
+              throw truncErr("litepack: array at byte " + start + " needs more bytes (count " + count + ", " + (buf.length - pos) + " remain)");
             }
             var arr = new Array(count);
             for (var i = 0; i < count; i++) {
@@ -579,10 +909,13 @@ var StableWebRTCModule = (() => {
             var f = fields[i];
             if (f.optional) {
               var val = data[f.name];
-              if (val !== void 0 && val !== null) bitmask |= 1 << f.optionalIndex;
+              if (val !== void 0 && val !== null) bitmask += f.optionalBit;
             }
           }
           return bitmask;
+        }
+        function bitmaskHas(bitmask, f) {
+          return Math.floor(bitmask / f.optionalBit) % 2 === 1;
         }
         function encodeFields(fields, optionalCount, data, buf, pos) {
           if (optionalCount > 0) pos += writeVarint(buildBitmask(fields, data), buf, pos);
@@ -610,10 +943,19 @@ var StableWebRTCModule = (() => {
           }
           for (var i = 0; i < fields.length; i++) {
             var f = fields[i];
-            if (f.optional && !(bitmask & 1 << f.optionalIndex)) continue;
+            if (f.optional && !bitmaskHas(bitmask, f)) {
+              if (f.hasDefault) data[f.name] = cloneDefault(f.defaultValue);
+              continue;
+            }
+            if (pos >= bufEnd && !f.isTail) {
+              throw truncErr("litepack: truncated input \u2014 buffer ended before field '" + f.name + "'");
+            }
             var result = f.isTail ? f.read(buf, pos, bufEnd) : f.read(buf, pos);
             data[f.name] = result.value;
             pos += result.bytesRead;
+            if (pos > bufEnd) {
+              throw truncErr("litepack: truncated input \u2014 field '" + f.name + "' ran past end of buffer");
+            }
             if (f.variants) {
               var key = String(result.value);
               var vd = f.variants[key];
@@ -631,27 +973,43 @@ var StableWebRTCModule = (() => {
           if (f.isTail) return val && val.length || 0;
           switch (f.type) {
             case "string":
-              var enc = utf8Encode2(val || "");
-              return varintSize(enc.length) + enc.length;
+              var slen = utf8ByteLength(val == null ? "" : String(val));
+              return varintSize(slen) + slen;
             case "bytes":
               var len = val && val.length || 0;
               return varintSize(len) + len;
             case "varint":
               return varintSize(val || 0);
+            case "svarint":
+              return varintSize(zigzag(Math.round(typeof val === "number" ? val : 0)));
             case "enum":
               var idx = f.enumOpts ? f.enumOpts.indexOf(val) : 0;
+              if (idx === -1 && typeof val === "number" && val >= 0) return varintSize(val);
               return varintSize(idx === -1 ? 0 : idx);
             case "set":
               var mask = 0;
               if (val && f.setOpts) {
                 for (var j = 0; j < val.length; j++) {
                   var fi = f.setOpts.indexOf(val[j]);
-                  if (fi !== -1) mask |= 1 << fi;
+                  if (fi !== -1) {
+                    var bit = Math.pow(2, fi);
+                    if (Math.floor(mask / bit) % 2 === 0) mask += bit;
+                  }
                 }
               }
               return varintSize(mask);
             case "fixed":
               return f.fixedLen;
+            case "const":
+              return estimateSingleField({ type: f.constBaseType, fixedSize: f.fixedSize }, f.constValue);
+            case "map":
+              var mk = val ? Object.keys(val) : [];
+              var ms = varintSize(mk.length);
+              for (var j = 0; j < mk.length; j++) {
+                ms += estimateSingleField(f.mapDef.keyField, f.mapDef.numericKeys ? Number(mk[j]) : mk[j]);
+                ms += estimateSingleField(f.mapDef.valField, val[mk[j]]);
+              }
+              return ms;
             case "struct":
               return estimateFieldSize(f.structDef.fields, f.structDef.optionalCount, val || {});
             case "array":
@@ -691,7 +1049,16 @@ var StableWebRTCModule = (() => {
           return size;
         }
         var litepack2 = {};
+        var _compiled = typeof WeakMap !== "undefined" ? /* @__PURE__ */ new WeakMap() : null;
         function compileDef(schema) {
+          if (_compiled) {
+            var c = _compiled.get(schema);
+            if (!c) {
+              c = compileFields(schema);
+              _compiled.set(schema, c);
+            }
+            return c;
+          }
           if (schema._lp) return schema._lp;
           schema._lp = compileFields(schema);
           return schema._lp;
@@ -701,10 +1068,16 @@ var StableWebRTCModule = (() => {
           data = data || {};
           var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data) + 16);
           var pos = encodeFields(c.fields, c.optionalCount, data, buf, 0);
+          if (pos > buf.length) throw new Error("litepack: encoded size exceeded estimate \u2014 custom codec with non-deterministic encode()?");
           return buf.subarray(0, pos);
         };
-        litepack2.decode = function(schema, buf) {
+        function normalizeBuf(buf, opts) {
           if (buf instanceof ArrayBuffer) buf = new Uint8Array(buf);
+          if (opts && opts.copy) buf = new Uint8Array(buf);
+          return buf;
+        }
+        litepack2.decode = function(schema, buf, opts) {
+          buf = normalizeBuf(buf, opts);
           var c = compileDef(schema);
           var data = {};
           decodeFields(c.fields, c.optionalCount, buf, 0, data, buf.length);
@@ -733,7 +1106,174 @@ var StableWebRTCModule = (() => {
             }
           };
         };
-        litepack2.version = "1.0.0";
+        litepack2.compile = function(schema) {
+          var c = compileFields(schema);
+          return {
+            encode: function(data) {
+              data = data || {};
+              var buf = new Uint8Array(estimateFieldSize(c.fields, c.optionalCount, data) + 16);
+              var pos = encodeFields(c.fields, c.optionalCount, data, buf, 0);
+              if (pos > buf.length) throw new Error("litepack: encoded size exceeded estimate \u2014 custom codec with non-deterministic encode()?");
+              return buf.subarray(0, pos);
+            },
+            decode: function(buf, opts) {
+              buf = normalizeBuf(buf, opts);
+              var data = {};
+              decodeFields(c.fields, c.optionalCount, buf, 0, data, buf.length);
+              return data;
+            },
+            byteLength: function(data) {
+              return estimateFieldSize(c.fields, c.optionalCount, data || {});
+            }
+          };
+        };
+        litepack2.tryDecode = function(schema, buf, opts) {
+          try {
+            return litepack2.decode(schema, buf, opts);
+          } catch (e) {
+            return null;
+          }
+        };
+        litepack2.byteLength = function(schema, data) {
+          var c = compileDef(schema);
+          return estimateFieldSize(c.fields, c.optionalCount, data || {});
+        };
+        litepack2.decodeFrom = function(schema, buf, offset, opts) {
+          buf = normalizeBuf(buf, opts);
+          offset = offset || 0;
+          var c = compileDef(schema);
+          var data = {};
+          var end = decodeFields(c.fields, c.optionalCount, buf, offset, data, buf.length);
+          return { value: data, bytesRead: end - offset };
+        };
+        litepack2.encodeInto = function(schema, data, buf, offset) {
+          offset = offset || 0;
+          data = data || {};
+          var c = compileDef(schema);
+          var need = estimateFieldSize(c.fields, c.optionalCount, data);
+          if (offset + need > buf.length) {
+            throw new Error("litepack: encodeInto needs " + need + " bytes at offset " + offset + ", buffer has " + (buf.length - offset));
+          }
+          return encodeFields(c.fields, c.optionalCount, data, buf, offset) - offset;
+        };
+        litepack2.concat = function(list) {
+          var total = 0, i;
+          for (i = 0; i < list.length; i++) total += list[i].length;
+          var out = new Uint8Array(total);
+          var pos = 0;
+          for (i = 0; i < list.length; i++) {
+            out.set(list[i], pos);
+            pos += list[i].length;
+          }
+          return out;
+        };
+        litepack2.reader = function(buf, opts) {
+          buf = normalizeBuf(buf, opts);
+          var r = {
+            offset: 0,
+            read: function(schema) {
+              var res = litepack2.decodeFrom(schema, buf, r.offset);
+              r.offset += res.bytesRead;
+              return res.value;
+            },
+            tryRead: function(schema) {
+              try {
+                return r.read(schema);
+              } catch (e) {
+                return null;
+              }
+            },
+            peek: function(schema) {
+              return litepack2.decodeFrom(schema, buf, r.offset).value;
+            },
+            skip: function(n) {
+              r.offset += n;
+              return r;
+            },
+            remaining: function() {
+              return buf.length - r.offset;
+            },
+            eof: function() {
+              return r.offset >= buf.length;
+            }
+          };
+          return r;
+        };
+        litepack2.writer = function() {
+          var parts = [];
+          var total = 0;
+          var w = {
+            write: function(schema, data) {
+              var c = compileDef(schema);
+              data = data || {};
+              var size = estimateFieldSize(c.fields, c.optionalCount, data);
+              parts.push([c, data, size]);
+              total += size;
+              return w;
+            },
+            raw: function(bytes) {
+              parts.push([null, bytes, bytes.length]);
+              total += bytes.length;
+              return w;
+            },
+            byteLength: function() {
+              return total;
+            },
+            bytes: function() {
+              var buf = new Uint8Array(total);
+              var pos = 0;
+              for (var i = 0; i < parts.length; i++) {
+                var p = parts[i];
+                if (p[0] === null) {
+                  buf.set(p[1], pos);
+                  pos += p[2];
+                } else pos = encodeFields(p[0].fields, p[0].optionalCount, p[1], buf, pos);
+              }
+              if (pos > buf.length) throw new Error("litepack: writer overflow \u2014 custom codec with non-deterministic encode()?");
+              return pos === total ? buf : buf.subarray(0, pos);
+            }
+          };
+          return w;
+        };
+        litepack2.assertComplete = function(schema, data, _path) {
+          var c = compileDef(schema);
+          var path = _path || "";
+          data = data || {};
+          for (var i = 0; i < c.fields.length; i++) {
+            var f = c.fields[i];
+            var val = data[f.name];
+            if (f.optional) continue;
+            if (val === void 0 || val === null) {
+              throw new Error("litepack: missing required field '" + path + f.name + "'");
+            }
+            if (f.type === "struct" && f.structDef) {
+              litepack2.assertComplete._check(f.structDef, val, path + f.name + ".");
+            }
+          }
+          return true;
+        };
+        litepack2.assertComplete._check = function(compiled, data, path) {
+          for (var i = 0; i < compiled.fields.length; i++) {
+            var f = compiled.fields[i];
+            var val = (data || {})[f.name];
+            if (f.optional) continue;
+            if (val === void 0 || val === null) {
+              throw new Error("litepack: missing required field '" + path + f.name + "'");
+            }
+            if (f.type === "struct" && f.structDef) {
+              litepack2.assertComplete._check(f.structDef, val, path + f.name + ".");
+            }
+          }
+        };
+        litepack2.codec("json", {
+          encode: function(v) {
+            return utf8Encode2(JSON.stringify(v === void 0 ? null : v));
+          },
+          decode: function(b) {
+            return JSON.parse(utf8Decode2(b, 0, b.length));
+          }
+        });
+        litepack2.version = "1.2.0";
         return litepack2;
       });
     }
@@ -756,12 +1296,14 @@ var StableWebRTCModule = (() => {
   var M_RAW = 0;
   var M_BYTEDIFF = 1;
   var M_LCS = 2;
+  var TE = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+  var TD = typeof TextDecoder !== "undefined" ? new TextDecoder() : null;
   function utf8Encode(s) {
-    if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(s);
+    if (TE) return TE.encode(s);
     return new Uint8Array(Buffer.from(s, "utf8"));
   }
   function utf8Decode(u8) {
-    if (typeof TextDecoder !== "undefined") return new TextDecoder().decode(u8);
+    if (TD) return TD.decode(u8);
     return Buffer.from(u8).toString("utf8");
   }
   function isU8(x) {
@@ -817,12 +1359,15 @@ var StableWebRTCModule = (() => {
     this.pos = 0;
   }
   Reader.prototype.byte = function() {
+    if (this.pos >= this.u8.length) throw new Error("compact-delta: truncated delta");
     return this.u8[this.pos++];
   };
   Reader.prototype.varint = function() {
     var r = 0, sh = 0, b;
     do {
+      if (this.pos >= this.u8.length) throw new Error("compact-delta: truncated varint");
       b = this.u8[this.pos++];
+      if (sh === 28 && b & 240) throw new Error("compact-delta: varint overflow");
       r |= (b & 127) << sh;
       sh += 7;
     } while (b & 128);
@@ -831,51 +1376,60 @@ var StableWebRTCModule = (() => {
   Reader.prototype.eof = function() {
     return this.pos >= this.u8.length;
   };
-  var WINDOW = 16;
+  var DEFAULT_WINDOW = 16;
   var RK_BASE = 257;
-  var RK_POW = (function() {
-    var p = 1;
-    for (var i = 0; i < WINDOW - 1; i++) p = Math.imul(p, RK_BASE) >>> 0;
-    return p >>> 0;
-  })();
+  var MAX_CHAIN = 32;
+  var HASH_MIX = 15;
+  var POW_CACHE = /* @__PURE__ */ Object.create(null);
+  function rkPow(win) {
+    var p = POW_CACHE[win];
+    if (p === void 0) {
+      p = 1;
+      for (var i = 0; i < win - 1; i++) p = Math.imul(p, RK_BASE) >>> 0;
+      POW_CACHE[win] = p;
+    }
+    return p;
+  }
   var OP_COPY = 0;
   var OP_INSERT = 1;
-  function buildAnchors(base) {
-    var anchors = /* @__PURE__ */ Object.create(null);
-    if (base.length < WINDOW) return anchors;
+  function buildChains(base, win) {
+    var n = base.length;
+    if (n < win) return null;
+    var count = n - win + 1;
+    var tsize = 1;
+    while (tsize < count * 2 && tsize < 1 << 24) tsize <<= 1;
+    var mask = tsize - 1;
+    var head = new Int32Array(tsize).fill(-1);
+    var next = new Int32Array(count);
+    var pow = rkPow(win);
     var h = 0, i;
-    for (i = 0; i < WINDOW; i++) h = Math.imul(h, RK_BASE) + base[i] >>> 0;
-    pushAnchor(anchors, h, 0);
-    for (var off = 1; off + WINDOW <= base.length; off++) {
-      var leaving = base[off - 1], entering = base[off + WINDOW - 1];
-      h = Math.imul(h - Math.imul(leaving, RK_POW) >>> 0, RK_BASE) + entering >>> 0;
-      pushAnchor(anchors, h, off);
+    for (i = 0; i < win; i++) h = Math.imul(h, RK_BASE) + base[i] >>> 0;
+    var slot = (h ^ h >>> HASH_MIX) & mask;
+    next[0] = head[slot];
+    head[slot] = 0;
+    for (var off = 1; off < count; off++) {
+      h = Math.imul(h - Math.imul(base[off - 1], pow) >>> 0, RK_BASE) + base[off + win - 1] >>> 0;
+      slot = (h ^ h >>> HASH_MIX) & mask;
+      next[off] = head[slot];
+      head[slot] = off;
     }
-    return anchors;
+    return { head, next, mask };
   }
-  function pushAnchor(anchors, h, off) {
-    var list = anchors[h];
-    if (list === void 0) anchors[h] = off;
-    else if (typeof list === "number") anchors[h] = [list, off];
-    else if (list.length < 32) list.push(off);
-  }
-  function anchorOffsets(anchors, h) {
-    var list = anchors[h];
-    if (list === void 0) return null;
-    return typeof list === "number" ? [list] : list;
-  }
-  function matchLength(base, baseOff, target, targetOff) {
+  function matchLength(base, baseOff, target, targetOff, win) {
     var n = 0;
-    if (Math.min(base.length - baseOff, target.length - targetOff) < WINDOW) return 0;
-    for (; n < WINDOW; n++) if (base[baseOff + n] !== target[targetOff + n]) return 0;
+    if (Math.min(base.length - baseOff, target.length - targetOff) < win) return 0;
+    for (; n < win; n++) if (base[baseOff + n] !== target[targetOff + n]) return 0;
     var bLen = base.length, tLen = target.length;
     while (baseOff + n < bLen && targetOff + n < tLen && base[baseOff + n] === target[targetOff + n]) n++;
     return n;
   }
-  function bytediffEncode(base, target) {
-    var anchors = buildAnchors(base);
+  function bytediffEncode(base, target, win) {
+    win = win || DEFAULT_WINDOW;
+    var chains = buildChains(base, win);
     var w = new Writer();
-    var tLen = target.length, i = 0, pendingStart = 0, h = 0, primed = false;
+    var tLen = target.length, bLen = base.length;
+    var pow = rkPow(win);
+    var i = 0, pendingStart = 0, h = 0, primed = false;
     function flush(upTo) {
       if (upTo > pendingStart) {
         w.byte(OP_INSERT);
@@ -884,38 +1438,51 @@ var StableWebRTCModule = (() => {
         w.bytes(target, pendingStart, len);
       }
     }
-    while (i < tLen) {
-      if (i + WINDOW <= tLen) {
-        if (!primed) {
-          h = 0;
-          for (var k = 0; k < WINDOW; k++) h = Math.imul(h, RK_BASE) + target[i + k] >>> 0;
-          primed = true;
-        }
-        var offsets = anchorOffsets(anchors, h), best = 0, bestOff = -1;
-        if (offsets) for (var oi = 0; oi < offsets.length; oi++) {
-          var ml = matchLength(base, offsets[oi], target, i);
-          if (ml > best) {
-            best = ml;
-            bestOff = offsets[oi];
+    if (chains) {
+      var head = chains.head, next = chains.next, mask = chains.mask;
+      while (i < tLen) {
+        if (i + win <= tLen) {
+          if (!primed) {
+            h = 0;
+            for (var k = 0; k < win; k++) h = Math.imul(h, RK_BASE) + target[i + k] >>> 0;
+            primed = true;
           }
-        }
-        if (best >= WINDOW) {
-          flush(i);
-          w.byte(OP_COPY);
-          w.varint(bestOff);
-          w.varint(best);
-          i += best;
-          pendingStart = i;
-          primed = false;
-          continue;
-        }
-        var leaving = target[i];
-        if (i + WINDOW < tLen) {
-          var entering = target[i + WINDOW];
-          h = Math.imul(h - Math.imul(leaving, RK_POW) >>> 0, RK_BASE) + entering >>> 0;
-        } else primed = false;
-        i++;
-      } else i++;
+          var e = head[(h ^ h >>> HASH_MIX) & mask];
+          var best = 0, bestOff = -1, tries = MAX_CHAIN;
+          while (e !== -1 && tries-- > 0) {
+            if (i + best >= tLen) break;
+            if (e + best < bLen && base[e + best] === target[i + best]) {
+              var ml = matchLength(base, e, target, i, win);
+              if (ml > best) {
+                best = ml;
+                bestOff = e;
+              }
+            }
+            e = next[e];
+          }
+          if (best >= win) {
+            while (bestOff > 0 && i > pendingStart && base[bestOff - 1] === target[i - 1]) {
+              bestOff--;
+              i--;
+              best++;
+            }
+            flush(i);
+            w.byte(OP_COPY);
+            w.varint(bestOff);
+            w.varint(best);
+            i += best;
+            pendingStart = i;
+            primed = false;
+            continue;
+          }
+          if (i + win < tLen) {
+            h = Math.imul(h - Math.imul(target[i], pow) >>> 0, RK_BASE) + target[i + win] >>> 0;
+          } else primed = false;
+          i++;
+        } else i++;
+      }
+    } else {
+      i = tLen;
     }
     flush(tLen);
     return w.finish();
@@ -925,9 +1492,11 @@ var StableWebRTCModule = (() => {
       var op = r.byte();
       if (op === OP_COPY) {
         var off = r.varint(), len = r.varint();
+        if (off + len > base.length) throw new Error("compact-delta: COPY out of base bounds");
         out.bytes(base, off, len);
       } else if (op === OP_INSERT) {
         var ilen = r.varint();
+        if (r.pos + ilen > r.u8.length) throw new Error("compact-delta: truncated INSERT");
         out.bytes(r.u8, r.pos, ilen);
         r.pos += ilen;
       } else throw new Error("delta: corrupt bytediff op " + op);
@@ -980,11 +1549,8 @@ var StableWebRTCModule = (() => {
   }
   function myersBisect(a, b, deadline) {
     var n = a.length, m = b.length, max = Math.ceil((n + m) / 2), vo = max, vl = 2 * max;
-    var v1 = new Array(vl), v2 = new Array(vl), x;
-    for (x = 0; x < vl; x++) {
-      v1[x] = -1;
-      v2[x] = -1;
-    }
+    var v1 = new Int32Array(vl).fill(-1);
+    var v2 = new Int32Array(vl).fill(-1);
     v1[vo + 1] = 0;
     v2[vo + 1] = 0;
     var delta = n - m, front = delta % 2 !== 0;
@@ -995,7 +1561,7 @@ var StableWebRTCModule = (() => {
         if (k1 === -d || k1 !== d && v1[k1o - 1] < v1[k1o + 1]) x1 = v1[k1o + 1];
         else x1 = v1[k1o - 1] + 1;
         var y1 = x1 - k1;
-        while (x1 < n && y1 < m && a[x1] === b[y1]) {
+        while (x1 < n && y1 < m && a.charCodeAt(x1) === b.charCodeAt(y1)) {
           x1++;
           y1++;
         }
@@ -1011,7 +1577,7 @@ var StableWebRTCModule = (() => {
         if (k2 === -d || k2 !== d && v2[k2o2 - 1] < v2[k2o2 + 1]) x2 = v2[k2o2 + 1];
         else x2 = v2[k2o2 - 1] + 1;
         var y2 = x2 - k2;
-        while (x2 < n && y2 < m && a[n - x2 - 1] === b[m - y2 - 1]) {
+        while (x2 < n && y2 < m && a.charCodeAt(n - x2 - 1) === b.charCodeAt(m - y2 - 1)) {
           x2++;
           y2++;
         }
@@ -1098,8 +1664,10 @@ var StableWebRTCModule = (() => {
   var LCS_EQUAL = 0;
   var LCS_INSERT = 1;
   var LCS_DELETE = 2;
-  function lcsEncode(base, target) {
-    var diffs = myersDiff(bytesToLatin1(base), bytesToLatin1(target));
+  function lcsEncode(base, target, budgetMs) {
+    var deadline = Date.now() + (typeof budgetMs === "number" ? budgetMs : 1e3);
+    var diffs = myersDiff(bytesToLatin1(base), bytesToLatin1(target), deadline);
+    while (diffs.length && diffs[diffs.length - 1][0] === DIFF_DELETE) diffs.pop();
     var w = new Writer();
     for (var i = 0; i < diffs.length; i++) {
       var op = diffs[i][0], s = diffs[i][1], len = s.length;
@@ -1122,17 +1690,21 @@ var StableWebRTCModule = (() => {
     while (!r.eof()) {
       var op = r.byte(), len = r.varint();
       if (op === LCS_EQUAL) {
+        if (basePos + len > base.length) throw new Error("compact-delta: EQUAL out of base bounds");
         out.bytes(base, basePos, len);
         basePos += len;
       } else if (op === LCS_DELETE) {
         basePos += len;
       } else if (op === LCS_INSERT) {
+        if (r.pos + len > r.u8.length) throw new Error("compact-delta: truncated INSERT");
         out.bytes(r.u8, r.pos, len);
         r.pos += len;
       } else throw new Error("delta: corrupt lcs op " + op);
     }
   }
   var METHOD_NAMES = { 0: "raw", 1: "bytediff", 2: "lcs" };
+  var LCS_MIN_BUDGET_MS = 5;
+  var LCS_SKIP_BELOW = 64;
   function tryEncodeSync(baseInput, targetInput, options) {
     var base = toU8(baseInput), target = toU8(targetInput);
     if (typeof options === "string") options = { method: options };
@@ -1140,11 +1712,17 @@ var StableWebRTCModule = (() => {
     var minRatio = typeof options.minRatio === "number" ? options.minRatio : 1;
     var method = options.method || "auto";
     var strict = options.strict === true;
+    var win = typeof options.window === "number" ? options.window : DEFAULT_WINDOW;
+    var lcsMs = typeof options.lcsMs === "number" ? options.lcsMs : 1e3;
+    var exhaustive = options.exhaustive === true;
     if (method !== "auto" && method !== "bytediff" && method !== "lcs" && method !== "raw") {
       throw new TypeError("compact-delta: method must be 'auto', 'bytediff', 'lcs', or 'raw'");
     }
-    var tag, payload;
-    if (method === "auto" && bytesEqual(base, target)) {
+    if (win < 4 || win > 1024) {
+      throw new TypeError("compact-delta: window must be between 4 and 1024");
+    }
+    var tag, payload, candidates = null;
+    if (method === "auto" && target.length >= 2 && bytesEqual(base, target)) {
       var we = new Writer();
       we.byte(LCS_EQUAL);
       we.varint(base.length);
@@ -1157,24 +1735,31 @@ var StableWebRTCModule = (() => {
       tag = M_RAW;
       payload = target;
     } else if (method === "bytediff" || method === "lcs") {
-      payload = method === "bytediff" ? bytediffEncode(base, target) : lcsEncode(base, target);
+      payload = method === "bytediff" ? bytediffEncode(base, target, win) : lcsEncode(base, target, lcsMs);
       tag = method === "bytediff" ? M_BYTEDIFF : M_LCS;
       if (!strict && payload.length >= target.length) {
         tag = M_RAW;
         payload = target;
       }
     } else {
-      var bd = bytediffEncode(base, target);
-      var lcs = lcsEncode(base, target);
+      var bd = bytediffEncode(base, target, win);
       tag = M_RAW;
       payload = target;
       if (bd.length < payload.length) {
         tag = M_BYTEDIFF;
         payload = bd;
       }
-      if (lcs.length < payload.length) {
-        tag = M_LCS;
-        payload = lcs;
+      candidates = { raw: 1 + target.length, bytediff: 1 + bd.length };
+      var bestRatio = target.length ? payload.length / target.length : 0;
+      var budget = exhaustive ? lcsMs : Math.min(lcsMs, lcsMs * bestRatio);
+      var runLcs = exhaustive || budget >= LCS_MIN_BUDGET_MS && payload.length > LCS_SKIP_BELOW;
+      if (runLcs) {
+        var lcs = lcsEncode(base, target, budget);
+        candidates.lcs = 1 + lcs.length;
+        if (lcs.length < payload.length) {
+          tag = M_LCS;
+          payload = lcs;
+        }
       }
     }
     var deltaBytes = prepend(tag, payload);
@@ -1185,7 +1770,8 @@ var StableWebRTCModule = (() => {
       worthwhile,
       size: deltaBytes.length,
       raw: target.length,
-      ratio: target.length ? deltaBytes.length / target.length : 0
+      ratio: target.length ? deltaBytes.length / target.length : 0,
+      candidates
     };
   }
   var schedule = typeof queueMicrotask === "function" ? queueMicrotask : function(fn) {
@@ -1214,11 +1800,17 @@ var StableWebRTCModule = (() => {
   function encodeString(base, target, opt, cb) {
     var a = splitOptsCb(opt, cb);
     runAsync(a.cb, function() {
+      if (typeof base !== "string" || typeof target !== "string") {
+        throw new TypeError("compact-delta: encodeString expects string arguments (use encode for bytes)");
+      }
       return tryEncodeSync(utf8Encode(base), utf8Encode(target), a.options).delta;
     });
   }
   function decodeString(base, delta, cb) {
     runAsync(cb, function() {
+      if (typeof base !== "string") {
+        throw new TypeError("compact-delta: decodeString expects a string base (use decode for bytes)");
+      }
       return utf8Decode(decodeSync(utf8Encode(base), delta));
     });
   }
@@ -1507,23 +2099,49 @@ var StableWebRTCModule = (() => {
     }
     callback(null);
   }
+  var MAX_INFLATED_SIZE = 8 * 1024 * 1024;
   function decompress_deflate_bytes(u8, callback) {
     var input = asU8(u8);
     if (_HAS_STREAMS) {
       try {
+        let pump_read = function() {
+          reader.read().then(function(res) {
+            if (res.done) {
+              var out = new Uint8Array(total), off = 0;
+              for (var i = 0; i < chunks.length; i++) {
+                out.set(chunks[i], off);
+                off += chunks[i].byteLength;
+              }
+              callback(out);
+              return;
+            }
+            total += res.value.byteLength;
+            if (total > MAX_INFLATED_SIZE) {
+              try {
+                reader.cancel();
+              } catch (e) {
+              }
+              callback(null);
+              return;
+            }
+            chunks.push(res.value);
+            pump_read();
+          }).catch(function() {
+            callback(null);
+          });
+        };
         var stream = new Response(input).body.pipeThrough(new DecompressionStream("deflate"));
-        new Response(stream).arrayBuffer().then(function(buf) {
-          callback(new Uint8Array(buf));
-        }).catch(function() {
-          callback(null);
-        });
+        var reader = stream.getReader();
+        var chunks = [];
+        var total = 0;
+        pump_read();
         return;
       } catch (e) {
       }
     }
     var zlib = getZlib();
     if (zlib && zlib.inflate) {
-      zlib.inflate(Buffer.from(input), function(err, result) {
+      zlib.inflate(Buffer.from(input), { maxOutputLength: MAX_INFLATED_SIZE }, function(err, result) {
         callback(err ? null : new Uint8Array(result));
       });
       return;
@@ -1550,9 +2168,10 @@ var StableWebRTCModule = (() => {
     ["payload", "tail"]
   ];
   var SCHEMA_NEG_DONE = [["seq", "uint16"], ["epoch", "uint16"]];
-  var SCHEMA_FAILD_DECOMPRESS = [["failed_type", "uint8"], ["seq", "uint16"]];
+  var SCHEMA_FAILED_DECOMPRESS = [["failed_type", "uint8"], ["seq", "uint16"]];
   var SCHEMA_TOTAL_ICE = [["total", "uint16"], ["ufrag", "tail"]];
   var SCHEMA_ACK = [["seq", "uint16"]];
+  var SCHEMA_PING = [["timestamp", "varint"]];
   var SCHEMA_SDP_MIN = [
     ["setup", "enum", ["actpass", "active", "passive"]],
     ["maxMessageSize", "uint32"],
@@ -1633,6 +2252,8 @@ var StableWebRTCModule = (() => {
         delete store[oldest];
       }
       entry = store[ch.msg_id] = { parts: new Array(ch.total), received: 0, total: ch.total, ts: now };
+    } else if (entry.total !== ch.total) {
+      return null;
     }
     entry.ts = now;
     if (!entry.parts[ch.index]) {
@@ -1641,7 +2262,13 @@ var StableWebRTCModule = (() => {
     }
     if (entry.received === entry.total) {
       var totalLen = 0, j;
-      for (j = 0; j < entry.total; j++) totalLen += entry.parts[j].byteLength;
+      for (j = 0; j < entry.total; j++) {
+        if (!entry.parts[j]) {
+          delete store[ch.msg_id];
+          return null;
+        }
+        totalLen += entry.parts[j].byteLength;
+      }
       var full = new Uint8Array(totalLen), off = 0;
       for (j = 0; j < entry.total; j++) {
         full.set(entry.parts[j], off);
@@ -2287,10 +2914,11 @@ var StableWebRTCModule = (() => {
     TOTAL_ICE_CANDIDATE: 13,
     NEGOTIATION_DONE: 14,
     MEDIASTREAM_MAP: 15,
-    FAILD_DECOMPRESS: 16,
+    FAILED_DECOMPRESS: 16,
     PING: 17,
     MEDIASTREAM_MAP_ACK: 18,
-    SIGNAL_CHUNK: 19
+    SIGNAL_CHUNK: 19,
+    PONG: 20
   };
   function StableWebRTC(opts) {
     if (!(this instanceof StableWebRTC)) return new StableWebRTC(opts);
@@ -2367,8 +2995,29 @@ var StableWebRTCModule = (() => {
       current_local_candidate_type: null,
       current_remote_candidate_type: null,
       current_rtt: null,
+      current_ping_rtt: null,
       current_bandwidth_outgoing: null,
       current_connection_type: "unknown",
+      // Application-level ping/pong keepalive + RTT probe (over the signal
+      // channel, i.e. the data channel once open). Mirrors the WS manager:
+      // PING carries a timestamp, the peer echoes it back as PONG, and we
+      // compute RTT against our own clock. Random interval avoids lockstep.
+      ping_timer: null,
+      ping_enabled: true,
+      ping_interval_min: 1e3,
+      ping_interval_max: 3e3,
+      // Liveness watchdog. ICE-lite peers (e.g. a webrtc-server answerer) run
+      // NO connectivity checks of their own, so their iceConnectionState rarely
+      // moves to 'disconnected'/'failed' when the link dies — they just sit in
+      // 'connected' forever. We therefore detect death independently: any
+      // inbound DC traffic (data/signal/pong) refreshes last_recv_time, and a
+      // watchdog declares the link dead if nothing arrives within the timeout.
+      // Recovery then goes through the same ICE-restart path; if that is
+      // exhausted, we close. Needs to outlast a few ping intervals.
+      liveness_timer: null,
+      liveness_enabled: true,
+      liveness_timeout_ms: 1e4,
+      last_recv_time: 0,
       // Track previous ice state for disconnect/reconnect events
       _prev_ice_connection_state: null,
       signaling_state: "new",
@@ -2384,6 +3033,17 @@ var StableWebRTCModule = (() => {
       auth_verified: false,
       local_nonce: Math.floor(Math.random() * 65534) + 1,
       remote_nonce: 0,
+      // Remote-restart detection. remote_nonce locks on the first message and
+      // any other nonce is rejected — correct against stale/replayed frames,
+      // but a peer that RESTARTED (crash, refresh) generates a fresh nonce and
+      // would be rejected forever, leaving both sides in a zombie re-offer
+      // loop. We count consecutive rejections that carry the SAME unfamiliar
+      // nonce; a consistent streak is the signature of a restart (random junk
+      // wouldn't repeat), and at the threshold we close so the app can create
+      // a fresh instance and reconnect.
+      nonce_mismatch_streak_nonce: 0,
+      nonce_mismatch_streak_count: 0,
+      nonce_mismatch_close_threshold: 5,
       create_data_channel_timer: null,
       list_data_channels: [],
       list_remote_candidates: {},
@@ -2400,6 +3060,12 @@ var StableWebRTCModule = (() => {
       ice_restart_count: 0,
       ice_restart_max_retries: 5,
       ice_restart_delay_ms: 3e3,
+      // Restart-budget refund requires proven stability (see the
+      // iceconnectionstatechange handler): a brief 'connected' blip on a
+      // flapping path must not refund the full retry budget, or the
+      // flap loop never exhausts and the connection zombies forever.
+      ice_restart_reset_timer: null,
+      ice_restart_stable_window_ms: 3e4,
       gathering_timeout_ms: 8e3,
       gathering_max_retries: 3,
       gathering_timeout_timer: null,
@@ -2407,6 +3073,7 @@ var StableWebRTCModule = (() => {
       wait_for_answer_timeout_timer: null,
       negotiation_done_timeout_timer: null,
       making_rollback: false,
+      polite_defer_started: null,
       pending_remote_offer_sdp: null,
       sent_local_offer_sdp: null,
       sent_local_answer_sdp: null,
@@ -2417,6 +3084,18 @@ var StableWebRTCModule = (() => {
       seq_remote_mediastream_map: 0,
       // --- signaling chunking (size-based; reassembly is all-or-nothing) ---
       max_signal_chunk_size: typeof opts.max_signal_chunk_size === "number" && opts.max_signal_chunk_size > 0 ? opts.max_signal_chunk_size : 1024,
+      // Perfect-negotiation role. Apps with a known topology (client↔server,
+      // caller↔callee) should say so — it makes the polite/impolite split
+      // deterministic from t=0 with zero handshake latency:
+      //   'lead'   → impolite: offers immediately, never yields in glare
+      //   'follow' → polite: defers opening offers, yields in glare
+      //   'auto'   → (default) derive from the nonce comparison once the
+      //              first remote frame arrives; bounded-deadline fallback.
+      // Discovered the hard way: 'auto' alone is chicken-and-egg in the
+      // OPENING (politeness needs nonces, nonces ride frames, Rule A
+      // holds the frames) — both sides sat out the full deadline. An
+      // explicit role costs the app one word and removes the standoff.
+      negotiation_role: opts.negotiationRole === "lead" || opts.negotiationRole === "follow" ? opts.negotiationRole : "auto",
       chunk_send_id_internal: 0,
       // rolling msg_id for the SCTP pipe
       chunk_send_id_external: 0,
@@ -2442,17 +3121,86 @@ var StableWebRTCModule = (() => {
       list_sending_live_mediastream: {},
       list_receiving_live_mediastream: {},
       data_channel_sending_messages_queue: [],
+      // Head index into the queue above — QUICO's pn-history pattern: the queue
+      // is drained by ADVANCING THIS INDEX (O(1)) instead of Array.shift (O(n),
+      // which made large drains O(n²) — measured as an 8-second event-loop stall
+      // at 80K queued tiny messages). The consumed prefix is physically freed by
+      // an occasional splice once the head crosses a threshold: amortized O(1).
+      data_q_head: 0,
+      // Running sum of payload bytes currently queued (unsent) — kept in sync by
+      // push/drain/expire/close so the public bufferedAmount getter is O(1)
+      // instead of O(queue) per read.
+      data_channel_queued_bytes: 0,
+      // Priority lane for library signaling once the DC is open (offers, answers,
+      // candidates, ping/pong, acks). Drained by the pump BEFORE the data queue,
+      // exempt from the user rate limits and from pause(): app-data throttling
+      // must never starve the traffic that keeps the connection alive and
+      // recoverable. Entries are {data, ts} — no callbacks; stale signaling is
+      // recovered by the message-level machinery, not by the queue.
+      signal_sending_messages_queue: [],
+      signal_q_head: 0,
+      // head-pointer drain, same pattern as data_q_head
+      // pause()/resume() valve. Gates ONLY the data-lane send loop inside the
+      // pump — never the pump tick itself (the expiry sweep and the signal lane
+      // must keep running while paused).
       data_channel_sending_messages_paused: false,
       data_channel_min_buffered_amount: 64 * 1024,
       data_channel_max_buffered_amount: 1 * 1024 * 1024,
-      data_channel_max_sending_messages_per_sec: 1e3,
-      data_channel_max_sending_bytes_per_sec: 64 * 1024,
+      // Rate limits are OPT-IN. Infinity (the default; users set it via 0 in
+      // options) means "no cap" — only the buffer watermarks below govern
+      // outgoing throughput. Any positive value is a hard ceiling, read live
+      // by the send pump, so it can be tuned at runtime via setConfiguration.
+      // NOTE: never apply |0 to these fields — Infinity|0 === 0.
+      data_channel_max_sending_messages_per_sec: Infinity,
+      data_channel_max_sending_bytes_per_sec: Infinity,
+      // A queued message that still hasn't reached the wire after this long is dropped
+      // and its callback settled as failed. Defaults to liveness_timeout_ms: if nothing
+      // has moved for that long the peer is already being declared dead, so a message
+      // still sitting in the queue is never going out.
+      data_channel_max_queue_age: 1e4,
       data_channel_pump_queue_timer: null,
+      // Sliding 1s windows. Same head-pointer pattern as the queues; the sent
+      // window additionally keeps RUNNING SUMS so the rate limiter reads its
+      // totals in O(1) instead of re-summing the window per message.
       data_channel_sent_events: [],
-      data_channel_recv_events: []
+      sent_events_head: 0,
+      sent_window_count: 0,
+      sent_window_bytes: 0,
+      data_channel_recv_events: [],
+      recv_events_head: 0,
+      // ICE server failures, deduped by "url|errorCode" so a broken TURN can't
+      // spam events: { "url|code": {url, code, text, count, first_ts, last_ts} }
+      ice_server_errors: {},
+      // Malformed inbound frames that were dropped rather than allowed to throw.
+      stats_dropped_malformed: 0,
+      last_malformed_emit_ts: 0,
+      // Queued outbound messages dropped because they aged past data_channel_max_queue_age.
+      stats_dropped_expired: 0,
+      last_expired_emit_ts: 0,
+      // Signal-lane entries dropped by the same TTL sweep. Counted silently (no
+      // event, no callback): signaling has its own recovery paths.
+      stats_dropped_expired_signals: 0,
+      // Remote ICE candidates dropped by the anti-flood caps (see
+      // add_remote_candidates): a hostile peer can spam candidates, and both the
+      // dedup indexOf and the priority sort are O(n)+ per insert.
+      stats_dropped_candidates: 0,
+      // Send attempts that threw but left the message queued for a later retry.
+      stats_send_failures: 0,
+      last_send_failure_emit_ts: 0
     };
+    function pc_alive() {
+      return connection.pc !== null && connection.pc.connectionState !== "closed";
+    }
+    function report_malformed_frame(source, error) {
+      connection.stats_dropped_malformed++;
+      var now = Date.now();
+      if (now - connection.last_malformed_emit_ts >= 1e3) {
+        connection.last_malformed_emit_ts = now;
+        ev.emit("error", "malformed inbound frame on " + source + " \u2014 dropped (" + connection.stats_dropped_malformed + " total): " + (error && error.message ? error.message : String(error)));
+      }
+    }
     function drain_pending_remote_candidates() {
-      if (connection.pc && connection.pc.connectionState !== "closed" && connection.pc.remoteDescription && connection.pc.remoteDescription.type) {
+      if (pc_alive() && connection.pc.remoteDescription && connection.pc.remoteDescription.type) {
         var current_remote_ufrag = get_ufrag_from_sdp(connection.pc.remoteDescription.sdp);
         var buckets = [];
         if (current_remote_ufrag && current_remote_ufrag in connection.list_remote_candidates) buckets.push(current_remote_ufrag);
@@ -2475,6 +3223,8 @@ var StableWebRTCModule = (() => {
         }
       }
     }
+    var MAX_REMOTE_UFRAG_BUCKETS = 8;
+    var MAX_REMOTE_CANDIDATES_PER_UFRAG = 256;
     function add_remote_candidates(candidate) {
       if (connection.remote_support_trickle_ice == null) {
         connection.remote_support_trickle_ice = true;
@@ -2489,12 +3239,20 @@ var StableWebRTCModule = (() => {
         }
       }
       if (!(of_ufrag in connection.list_remote_candidates)) {
+        if (Object.keys(connection.list_remote_candidates).length >= MAX_REMOTE_UFRAG_BUCKETS) {
+          connection.stats_dropped_candidates++;
+          return;
+        }
         connection.list_remote_candidates[of_ufrag] = {
           total: 0,
           drained: 0,
           pending: [],
           all: []
         };
+      }
+      if (connection.list_remote_candidates[of_ufrag].all.length >= MAX_REMOTE_CANDIDATES_PER_UFRAG) {
+        connection.stats_dropped_candidates++;
+        return;
       }
       if (connection.list_remote_candidates[of_ufrag].all.indexOf(candidate.candidate) < 0) {
         connection.list_remote_candidates[of_ufrag].all.push(candidate.candidate);
@@ -2531,7 +3289,7 @@ var StableWebRTCModule = (() => {
       }
     }
     function adopt_primary_data_channel() {
-      if (connection.pc && connection.pc.connectionState !== "closed") {
+      if (pc_alive()) {
         var winner_index = null;
         var winner_id = null;
         for (var i = 0; i < connection.list_data_channels.length; i++) {
@@ -2550,6 +3308,25 @@ var StableWebRTCModule = (() => {
           set_connection_state({
             data_channel_state: "closed"
           });
+          if (connection.data_channel_connect_time != null && connection.create_data_channel_timer == null) {
+            var any_still_alive = false;
+            for (var di = 0; di < connection.list_data_channels.length; di++) {
+              var ddc = connection.list_data_channels[di];
+              if (ddc && ddc.readyState !== "closed" && ddc.readyState !== "closing") {
+                any_still_alive = true;
+                break;
+              }
+            }
+            if (!any_still_alive) {
+              connection.create_data_channel_timer = setTimeout(function() {
+                connection.create_data_channel_timer = null;
+                if (pc_alive() && connection.data_channel_primary_index == null) {
+                  ev.emit("log", "all data channels died while the connection is alive \u2014 recreating");
+                  create_data_channel();
+                }
+              }, 50);
+            }
+          }
         } else {
           connection.data_channel_primary_index = winner_index;
           set_connection_state({
@@ -2558,7 +3335,7 @@ var StableWebRTCModule = (() => {
           for (var i = 0; i < connection.list_data_channels.length; i++) {
             var dc = connection.list_data_channels[i];
             if (dc && i !== winner_index) {
-              if (dc.readyState == "open" || dc.readyState == "connecting") {
+              if (dc.readyState == "open") {
                 try {
                   dc.close();
                 } catch (e) {
@@ -2591,8 +3368,8 @@ var StableWebRTCModule = (() => {
         }
       }
       var for_media = false;
-      for (var i in connection.created_transceivers) {
-        var ctc = connection.created_transceivers[i].tc;
+      for (var ti = 0; ti < connection.created_transceivers.length; ti++) {
+        var ctc = connection.created_transceivers[ti].tc;
         if (ctc) {
           if (!ctc.stopped && ctc.direction == "sendonly" && ctc.mid == null) {
             for_media = true;
@@ -2617,24 +3394,88 @@ var StableWebRTCModule = (() => {
           }
         }
       }
+      if (!for_media && connection.pc && typeof connection.pc.getTransceivers === "function") {
+        var all_tcs = connection.pc.getTransceivers();
+        for (var ati = 0; ati < all_tcs.length; ati++) {
+          var atc = all_tcs[ati];
+          if (atc && !atc.stopped) {
+            if ((atc.direction == "sendonly" || atc.direction == "sendrecv") && (atc.mid == null || atc.currentDirection == null)) {
+              for_media = true;
+              break;
+            }
+            if (atc.mid !== null && atc.currentDirection !== null && atc.direction !== atc.currentDirection) {
+              for_media = true;
+              break;
+            }
+          }
+        }
+      }
       if (for_datachannel == true || for_media == true || connection.need_ice_restart == true || connection.need_reoffer == true) {
         return true;
       } else {
         return false;
       }
     }
+    var _engine_diag = typeof process !== "undefined" && process.env && process.env.WEBRTC_DEBUG ? function(m) {
+      console.log("[engine-diag] " + m);
+    } : function() {
+    };
+    var POLITE_DEFER_MAX_MS = 2500;
+    function politeness() {
+      if (connection.negotiation_role === "lead") {
+        return false;
+      }
+      if (connection.negotiation_role === "follow") {
+        return true;
+      }
+      if (!connection.remote_nonce) {
+        return null;
+      }
+      if (connection.local_nonce === connection.remote_nonce) {
+        return null;
+      }
+      return connection.local_nonce < connection.remote_nonce;
+    }
+    function opening_phase() {
+      if (!connection.pc) {
+        return true;
+      }
+      return connection.pc.currentLocalDescription == null && connection.pc.currentRemoteDescription == null;
+    }
     function create_offer_schedule() {
       clearTimeout(connection.create_offer_timer);
       connection.create_offer_timer = null;
-      if (connection.create_offer_failures >= 10) return;
+      if (connection.create_offer_failures >= 10) {
+        _engine_diag("offer_schedule: LOCKED OUT (failures=" + connection.create_offer_failures + ")");
+        return;
+      }
       var base_delay = 5 + Math.floor(Math.random() * 15);
       var delay = Math.min(base_delay * Math.pow(2, connection.create_offer_failures), 5e3);
-      connection.create_offer_timer = setTimeout(function() {
+      _engine_diag("offer_schedule: armed, delay=" + delay + "ms failures=" + connection.create_offer_failures);
+      connection.create_offer_timer = setTimeout(function offer_timer_body() {
         connection.create_offer_timer = null;
+        if (opening_phase()) {
+          var _pol = politeness();
+          if (_pol === true || _pol === null) {
+            if (connection.polite_defer_started == null) {
+              connection.polite_defer_started = Date.now();
+              _engine_diag("RULE-A: " + (_pol === true ? "polite" : "politeness-unknown") + " \u2014 deferring opening offer (deadline " + POLITE_DEFER_MAX_MS + "ms)");
+            }
+            if (Date.now() - connection.polite_defer_started < POLITE_DEFER_MAX_MS) {
+              connection.create_offer_timer = setTimeout(offer_timer_body, 120);
+              return;
+            }
+            _engine_diag("RULE-A: defer deadline passed \u2014 offering anyway (liveness)");
+          }
+        }
         if (connection.pc && connection.negotiation_state == 0) {
-          if (is_negotiation_needed() == true) {
+          var _needed = is_negotiation_needed();
+          _engine_diag("offer_timer fired: neg=0, is_negotiation_needed=" + _needed);
+          if (_needed == true) {
             create_offer();
           }
+        } else {
+          _engine_diag("offer_timer fired: SKIPPED (pc=" + !!connection.pc + " neg=" + connection.negotiation_state + ")");
         }
       }, delay);
     }
@@ -2662,14 +3503,14 @@ var StableWebRTCModule = (() => {
         "current_connection_type"
       ];
       var prev = {};
-      for (var i in fields) {
-        prev[fields[i]] = structuredClone(connection[fields[i]]);
+      for (var fi = 0; fi < fields.length; fi++) {
+        prev[fields[fi]] = connection[fields[fi]];
       }
       if (options && typeof options === "object") {
-        for (var i in fields) {
-          if (fields[i] in options) {
-            if (connection[fields[i]] !== options[fields[i]]) {
-              connection[fields[i]] = options[fields[i]];
+        for (var fi2 = 0; fi2 < fields.length; fi2++) {
+          if (fields[fi2] in options) {
+            if (connection[fields[fi2]] !== options[fields[fi2]]) {
+              connection[fields[fi2]] = options[fields[fi2]];
               has_changed = true;
             }
           }
@@ -2684,6 +3525,8 @@ var StableWebRTCModule = (() => {
           }
           connection_getstats();
           data_channel_schedule_pump();
+          start_ping();
+          start_liveness();
         }
         if (connection.negotiation_state !== prev["negotiation_state"]) {
           if (connection.negotiation_state !== 2) {
@@ -2694,6 +3537,11 @@ var StableWebRTCModule = (() => {
             sctp_events();
             update_all_mediastream_senders();
             update_all_mediastream_receivers();
+            if (connection.renegotiation_pending == true && connection.create_offer_timer == null) {
+              _engine_diag("neg\u21920 cascade: re-arming latched renegotiation");
+              connection.renegotiation_pending = false;
+              create_offer_schedule();
+            }
             if (connection.pending_remote_offer_sdp !== null) {
               if (connection.pc && (connection.negotiation_state == 0 || connection.negotiation_state == 2 || connection.negotiation_state == 5)) {
                 set_remote_offer();
@@ -2766,7 +3614,7 @@ var StableWebRTCModule = (() => {
       }
     }
     function add_data_channel(dc) {
-      if (connection.pc && connection.pc.connectionState !== "closed") {
+      if (pc_alive()) {
         var dc_index = connection.list_data_channels.push(dc);
         dc.binaryType = "arraybuffer";
         dc.bufferedAmountLowThreshold = connection.data_channel_min_buffered_amount;
@@ -2775,26 +3623,39 @@ var StableWebRTCModule = (() => {
         };
         dc.onmessage = function(event) {
           var now = Date.now();
+          connection.last_recv_time = now;
           var bytes = event.data.byteLength || event.data.length || 0;
-          connection.data_channel_recv_events.push([now, bytes]);
-          while (connection.data_channel_recv_events.length && now - connection.data_channel_recv_events[0][0] > 1e3) {
-            connection.data_channel_recv_events.shift();
+          var rvs = connection.data_channel_recv_events;
+          rvs.push([now, bytes]);
+          while (connection.recv_events_head < rvs.length && now - rvs[connection.recv_events_head][0] > 1e3) {
+            connection.recv_events_head++;
           }
-          var _dcmsg = litepack_default.decode(SCHEMA_DC_MSG, event.data);
-          if (_dcmsg.type == MSGCODE_TYPE_MAP["SIGNAL_CHUNK"]) {
-            var _whole = reassemble_chunk(_dcmsg.data, connection.chunk_reasm_internal);
-            if (_whole !== null) {
-              var _inner = litepack_default.decode(SCHEMA_DC_MSG, _whole);
-              if (_inner.type == MSGCODE_TYPE_MAP["DATA"]) {
-                ev.emit("data", _inner.data);
-              } else {
-                process_income_signal(_inner.type, _inner.data);
+          if (rvs.length - connection.recv_events_head > 65536) {
+            connection.recv_events_head = rvs.length - 65536;
+          }
+          if (connection.recv_events_head >= 4096) {
+            rvs.splice(0, connection.recv_events_head);
+            connection.recv_events_head = 0;
+          }
+          try {
+            var _dcmsg = litepack_default.decode(SCHEMA_DC_MSG, event.data);
+            if (_dcmsg.type == MSGCODE_TYPE_MAP["SIGNAL_CHUNK"]) {
+              var _whole = reassemble_chunk(_dcmsg.data, connection.chunk_reasm_internal);
+              if (_whole !== null) {
+                var _inner = litepack_default.decode(SCHEMA_DC_MSG, _whole);
+                if (_inner.type == MSGCODE_TYPE_MAP["DATA"]) {
+                  ev.emit("data", _inner.data);
+                } else {
+                  process_income_signal(_inner.type, _inner.data);
+                }
               }
+            } else if (_dcmsg.type == MSGCODE_TYPE_MAP["DATA"]) {
+              ev.emit("data", _dcmsg.data);
+            } else {
+              process_income_signal(_dcmsg.type, _dcmsg.data);
             }
-          } else if (_dcmsg.type == MSGCODE_TYPE_MAP["DATA"]) {
-            ev.emit("data", _dcmsg.data);
-          } else {
-            process_income_signal(_dcmsg.type, _dcmsg.data);
+          } catch (error) {
+            report_malformed_frame("datachannel", error);
           }
         };
         dc.onbufferedamountlow = function() {
@@ -2805,12 +3666,12 @@ var StableWebRTCModule = (() => {
         };
         dc.onclose = function(event) {
           adopt_primary_data_channel();
-          if (connection.pc && connection.pc.connectionState !== "closed") {
+          if (pc_alive()) {
           }
         };
         dc.onerror = function(error) {
           adopt_primary_data_channel();
-          if (connection.pc && connection.pc.connectionState !== "closed") {
+          if (pc_alive()) {
             var msg = error;
             if (error && error.error && error.error.message) msg = error.error.message;
             else if (error && error.message) msg = error.message;
@@ -2819,8 +3680,8 @@ var StableWebRTCModule = (() => {
         };
       }
     }
-    function create_data_channel() {
-      if (connection.pc && connection.pc.connectionState !== "closed") {
+    function create_data_channel(schedule_offer) {
+      if (pc_alive()) {
         try {
           var dc = connection.pc.createDataChannel("dc", {
             reliable: false,
@@ -2832,14 +3693,16 @@ var StableWebRTCModule = (() => {
             maxMessageSize: 16 * 1024
           });
           add_data_channel(dc);
-          create_offer_schedule();
+          if (schedule_offer !== false) {
+            create_offer_schedule();
+          }
         } catch (error) {
           ev.emit("error", error);
         }
       }
     }
     function connection_getstats() {
-      if (connection.pc && connection.pc.signalingState !== "closed" && connection.pc.getStats) {
+      if (pc_alive() && connection.pc.getStats) {
         if (connection.getstats_running == false) {
           connection.getstats_running = true;
           if (connection.getstats_timer !== null) {
@@ -2987,7 +3850,7 @@ var StableWebRTCModule = (() => {
                     }
                     var rtp_bytes_sent = obj_reports["outbound-rtp"][i].bytesSent || 0;
                     for (var tag_id in connection.list_sending_live_mediastream) {
-                      if (Number(obj_reports["outbound-rtp"][i].mid) == connection.list_sending_live_mediastream[tag_id].video_mid) {
+                      if (String(obj_reports["outbound-rtp"][i].mid) === String(connection.list_sending_live_mediastream[tag_id].video_mid)) {
                         var srec = connection.list_sending_live_mediastream[tag_id];
                         srec.video_active = sending_status === 1;
                         if ("frameHeight" in obj_reports["outbound-rtp"][i]) {
@@ -3003,25 +3866,25 @@ var StableWebRTCModule = (() => {
                           srec.current_video_mime_type = codec_mime_type;
                         }
                         var now_ts = Date.now();
-                        if (srec._prev_stats_time > 0 && rtp_bytes_sent >= srec._prev_video_bytes_sent) {
-                          var dt = (now_ts - srec._prev_stats_time) / 1e3;
+                        if (srec._prev_video_stats_time > 0 && rtp_bytes_sent >= srec._prev_video_bytes_sent) {
+                          var dt = (now_ts - srec._prev_video_stats_time) / 1e3;
                           if (dt > 0) srec.video_bitrate = Math.round((rtp_bytes_sent - srec._prev_video_bytes_sent) * 8 / dt);
                         }
                         srec._prev_video_bytes_sent = rtp_bytes_sent;
-                        srec._prev_stats_time = now_ts;
-                      } else if (Number(obj_reports["outbound-rtp"][i].mid) == connection.list_sending_live_mediastream[tag_id].audio_mid) {
+                        srec._prev_video_stats_time = now_ts;
+                      } else if (String(obj_reports["outbound-rtp"][i].mid) === String(connection.list_sending_live_mediastream[tag_id].audio_mid)) {
                         var srec_a = connection.list_sending_live_mediastream[tag_id];
                         srec_a.audio_active = sending_status === 1;
                         if (codec_mime_type !== null) {
                           srec_a.audio_mime_type = codec_mime_type;
                         }
                         var now_ts_a = Date.now();
-                        if (srec_a._prev_stats_time > 0 && rtp_bytes_sent >= srec_a._prev_audio_bytes_sent) {
-                          var dt_a = (now_ts_a - srec_a._prev_stats_time) / 1e3;
+                        if (srec_a._prev_audio_stats_time > 0 && rtp_bytes_sent >= srec_a._prev_audio_bytes_sent) {
+                          var dt_a = (now_ts_a - srec_a._prev_audio_stats_time) / 1e3;
                           if (dt_a > 0) srec_a.audio_bitrate = Math.round((rtp_bytes_sent - srec_a._prev_audio_bytes_sent) * 8 / dt_a);
                         }
                         srec_a._prev_audio_bytes_sent = rtp_bytes_sent;
-                        if (!srec_a._prev_stats_time) srec_a._prev_stats_time = now_ts_a;
+                        srec_a._prev_audio_stats_time = now_ts_a;
                       }
                     }
                   }
@@ -3046,7 +3909,7 @@ var StableWebRTCModule = (() => {
                     var rtp_jitter = obj_reports["inbound-rtp"][i].jitter || 0;
                     var rtp_fps = obj_reports["inbound-rtp"][i].framesPerSecond || 0;
                     for (var tag_id in connection.list_receiving_live_mediastream) {
-                      if (Number(obj_reports["inbound-rtp"][i].mid) == connection.list_receiving_live_mediastream[tag_id].video_mid) {
+                      if (String(obj_reports["inbound-rtp"][i].mid) === String(connection.list_receiving_live_mediastream[tag_id].video_mid)) {
                         var rrec = connection.list_receiving_live_mediastream[tag_id];
                         if ("frameHeight" in obj_reports["inbound-rtp"][i]) {
                           rrec.current_video_frame_height = obj_reports["inbound-rtp"][i].frameHeight;
@@ -3059,12 +3922,12 @@ var StableWebRTCModule = (() => {
                         rrec.video_active = rtp_fps > 0;
                         rrec.video_jitter = rtp_jitter;
                         var now_rv = Date.now();
-                        if (rrec._prev_stats_time > 0 && rtp_bytes_recv >= rrec._prev_video_bytes_received) {
-                          var dt_rv = (now_rv - rrec._prev_stats_time) / 1e3;
+                        if (rrec._prev_video_stats_time > 0 && rtp_bytes_recv >= rrec._prev_video_bytes_received) {
+                          var dt_rv = (now_rv - rrec._prev_video_stats_time) / 1e3;
                           if (dt_rv > 0) rrec.video_bitrate = Math.round((rtp_bytes_recv - rrec._prev_video_bytes_received) * 8 / dt_rv);
                         }
                         rrec._prev_video_bytes_received = rtp_bytes_recv;
-                        rrec._prev_stats_time = now_rv;
+                        rrec._prev_video_stats_time = now_rv;
                         var total_v = rtp_packets_recv + rtp_packets_lost;
                         if (total_v > 0) {
                           var prev_total_v = rrec._prev_video_packets_received + rrec._prev_video_packets_lost;
@@ -3075,18 +3938,18 @@ var StableWebRTCModule = (() => {
                         }
                         rrec._prev_video_packets_received = rtp_packets_recv;
                         rrec._prev_video_packets_lost = rtp_packets_lost;
-                      } else if (Number(obj_reports["inbound-rtp"][i].mid) == connection.list_receiving_live_mediastream[tag_id].audio_mid) {
+                      } else if (String(obj_reports["inbound-rtp"][i].mid) === String(connection.list_receiving_live_mediastream[tag_id].audio_mid)) {
                         var rrec_a = connection.list_receiving_live_mediastream[tag_id];
                         if (codec_mime_type !== null) rrec_a.current_audio_mime_type = codec_mime_type;
                         rrec_a.audio_active = rtp_packets_recv > rrec_a._prev_audio_packets_received;
                         rrec_a.audio_jitter = rtp_jitter;
                         var now_ra = Date.now();
-                        if (rrec_a._prev_stats_time > 0 && rtp_bytes_recv >= rrec_a._prev_audio_bytes_received) {
-                          var dt_ra = (now_ra - rrec_a._prev_stats_time) / 1e3;
+                        if (rrec_a._prev_audio_stats_time > 0 && rtp_bytes_recv >= rrec_a._prev_audio_bytes_received) {
+                          var dt_ra = (now_ra - rrec_a._prev_audio_stats_time) / 1e3;
                           if (dt_ra > 0) rrec_a.audio_bitrate = Math.round((rtp_bytes_recv - rrec_a._prev_audio_bytes_received) * 8 / dt_ra);
                         }
                         rrec_a._prev_audio_bytes_received = rtp_bytes_recv;
-                        if (!rrec_a._prev_stats_time) rrec_a._prev_stats_time = now_ra;
+                        rrec_a._prev_audio_stats_time = now_ra;
                         var total_a = rtp_packets_recv + rtp_packets_lost;
                         if (total_a > 0) {
                           var delta_recv_a = rtp_packets_recv - rrec_a._prev_audio_packets_received;
@@ -3114,10 +3977,65 @@ var StableWebRTCModule = (() => {
         }
       }
     }
+    function schedule_ping() {
+      if (connection.ping_enabled === false) return;
+      clearTimeout(connection.ping_timer);
+      var span = Math.max(0, connection.ping_interval_max - connection.ping_interval_min);
+      var delay = connection.ping_interval_min + Math.floor(Math.random() * span);
+      connection.ping_timer = setTimeout(function() {
+        connection.ping_timer = null;
+        if (pc_alive() && connection.data_channel_state === "open") {
+          try {
+            send_signal(MSGCODE_TYPE_MAP["PING"], litepack_default.encode(SCHEMA_PING, { timestamp: Date.now() }));
+          } catch (error) {
+          }
+          schedule_ping();
+        }
+      }, delay);
+    }
+    function start_ping() {
+      if (connection.ping_enabled === false) return;
+      if (connection.ping_timer !== null) return;
+      schedule_ping();
+    }
+    function liveness_period() {
+      return Math.max(1e3, Math.floor(connection.liveness_timeout_ms / 3));
+    }
+    function check_liveness() {
+      connection.liveness_timer = null;
+      if (!pc_alive()) return;
+      if (connection.liveness_enabled === false) return;
+      var idle = Date.now() - connection.last_recv_time;
+      if (connection.last_recv_time > 0 && idle >= connection.liveness_timeout_ms) {
+        var ice = connection.pc.iceConnectionState;
+        if (ice === "connected" || ice === "completed") {
+          ev.emit("disconnect", { reason: "timeout", restartCount: connection.ice_restart_count });
+          if (connection.ice_restart_count < connection.ice_restart_max_retries) {
+            connection.ice_restart_count++;
+            connection.last_recv_time = Date.now();
+            restartIce();
+          } else {
+            ev.emit("error", "connection lost \u2014 no inbound traffic for " + idle + "ms; closing after " + connection.ice_restart_max_retries + " recovery attempts");
+            close_connection();
+            return;
+          }
+        }
+      }
+      connection.liveness_timer = setTimeout(check_liveness, liveness_period());
+    }
+    function start_liveness() {
+      if (connection.liveness_enabled === false) return;
+      if (connection.liveness_timer !== null) return;
+      connection.last_recv_time = Date.now();
+      connection.liveness_timer = setTimeout(check_liveness, liveness_period());
+    }
     function build_connection_info() {
       return {
         type: connection.current_connection_type || "unknown",
         rtt: connection.current_rtt,
+        // ICE/DTLS-level (from getStats; may be null on some bindings)
+        ping_rtt: connection.current_ping_rtt,
+        // app-level DataChannel round-trip (from ping/pong)
         bandwidth_outgoing: connection.current_bandwidth_outgoing,
         local: {
           ip: connection.current_local_ip,
@@ -3148,6 +4066,7 @@ var StableWebRTCModule = (() => {
         sctp_ice_state: connection.sctp_ice_state,
         connection_type: connection.current_connection_type,
         rtt: connection.current_rtt,
+        ping_rtt: connection.current_ping_rtt,
         bandwidth_outgoing: connection.current_bandwidth_outgoing,
         need_ice_restart: connection.need_ice_restart,
         ice_restart_count: connection.ice_restart_count,
@@ -3201,7 +4120,7 @@ var StableWebRTCModule = (() => {
       }
     }
     function sctp_events() {
-      if (connection.pc && connection.pc.connectionState !== "closed") {
+      if (pc_alive()) {
         if (connection.pc.sctp && connection.sctp == null) {
           connection.sctp = connection.pc.sctp;
           adopt_primary_data_channel();
@@ -3233,7 +4152,7 @@ var StableWebRTCModule = (() => {
           try {
             if (connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport && "onstatechange" in connection.pc.sctp.transport.iceTransport) {
               connection.pc.sctp.transport.iceTransport.onstatechange = function() {
-                if (connection.pc && connection.pc.connectionState !== "closed") {
+                if (pc_alive()) {
                   set_connection_state({
                     sctp_ice_state: String(connection.pc.sctp.transport.iceTransport.state) + ""
                   });
@@ -3247,7 +4166,7 @@ var StableWebRTCModule = (() => {
           try {
             if (connection.pc.sctp.transport && "onstatechange" in connection.pc.sctp.transport) {
               connection.pc.sctp.transport.onstatechange = function() {
-                if (connection.pc && connection.pc.connectionState !== "closed") {
+                if (pc_alive()) {
                   set_connection_state({
                     sctp_dtls_state: String(connection.pc.sctp.transport.state) + ""
                   });
@@ -3261,7 +4180,7 @@ var StableWebRTCModule = (() => {
           try {
             if ("onstatechange" in connection.pc.sctp) {
               connection.pc.sctp.onstatechange = function() {
-                if (connection.pc && connection.pc.connectionState !== "closed") {
+                if (pc_alive()) {
                   set_connection_state({
                     sctp_state: String(connection.pc.sctp.state) + ""
                   });
@@ -3275,12 +4194,14 @@ var StableWebRTCModule = (() => {
           try {
             if (connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport && "onselectedcandidatepairchange" in connection.pc.sctp.transport.iceTransport) {
               connection.pc.sctp.transport.iceTransport.onselectedcandidatepairchange = function() {
-                var selected_candidate_pair = connection.pc.sctp.transport.iceTransport.getSelectedCandidatePair();
-                set_connection_state({
-                  local_protocol: selected_candidate_pair.local.protocol,
-                  remote_protocol: selected_candidate_pair.remote.protocol
-                });
-                connection_getstats();
+                if (pc_alive()) {
+                  var selected_candidate_pair = connection.pc.sctp.transport.iceTransport.getSelectedCandidatePair();
+                  set_connection_state({
+                    local_protocol: selected_candidate_pair.local.protocol,
+                    remote_protocol: selected_candidate_pair.remote.protocol
+                  });
+                  connection_getstats();
+                }
               };
             }
           } catch (error) {
@@ -3302,12 +4223,13 @@ var StableWebRTCModule = (() => {
           connection.local_offer_history[seq_offer - 1][1] = Date.now();
         }
       }
-      if (connection.negotiation_state == 2 && connection.pc.signalingState == "have-local-offer") {
+      if (pc_alive() && connection.negotiation_state == 2 && connection.pc.signalingState == "have-local-offer") {
         if (seq_offer == connection.local_offer_history.length) {
           set_connection_state({
             negotiation_state: 3
           });
           connection.pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp })).then(function() {
+            if (!pc_alive()) return;
             drain_pending_remote_candidates();
             if (connection.negotiation_state == 3 && seq_offer == connection.local_offer_history.length) {
               connection.base_offer_sdp = String(connection.sent_local_offer_sdp) + "";
@@ -3358,6 +4280,27 @@ var StableWebRTCModule = (() => {
         } else {
           if (connection.making_rollback == false) {
             connection.making_rollback = true;
+            if (connection.data_channel_connect_time == null && (connection.pc.sctp == null || connection.pc.sctp.state !== "connected")) {
+              var _had = connection.list_data_channels.length;
+              var _closed = 0;
+              for (var _di = connection.list_data_channels.length - 1; _di >= 0; _di--) {
+                var _dc = connection.list_data_channels[_di];
+                if (_dc && _dc.readyState === "connecting") {
+                  try {
+                    _dc.close();
+                  } catch (_e) {
+                  }
+                  connection.list_data_channels.splice(_di, 1);
+                  _closed++;
+                }
+              }
+              if (_closed > 0) {
+                if (connection.list_data_channels.length === 0) {
+                  connection.data_channel_primary_index = null;
+                }
+                ev.emit("log", "app-glare rollback: closed " + _closed + "/" + _had + " never-opened data channel(s) before rollback (Chrome SCTP-wedge workaround)");
+              }
+            }
             connection.pc.setLocalDescription({ type: "rollback" }).then(function() {
               connection.making_rollback = false;
               if (typeof callback == "function") {
@@ -3397,10 +4340,10 @@ var StableWebRTCModule = (() => {
     function set_remote_offer() {
       if (connection.pending_remote_offer_sdp !== null) {
         let create_answer = function() {
-          if (connection.negotiation_state == 4 && connection.pc.signalingState == "have-remote-offer") {
+          if (pc_alive() && connection.negotiation_state == 4 && connection.pc.signalingState == "have-remote-offer") {
             var this_answer_for_seq = Number(connection.seq_remote_offer) + 0;
             connection.pc.createAnswer().then(function(answer) {
-              if (connection.negotiation_state == 4 && connection.pc.signalingState == "have-remote-offer" && this_answer_for_seq == connection.seq_remote_offer) {
+              if (pc_alive() && connection.negotiation_state == 4 && connection.pc.signalingState == "have-remote-offer" && this_answer_for_seq == connection.seq_remote_offer) {
                 if ("toJSON" in answer && typeof answer.toJSON == "function") {
                   var answer_json = answer.toJSON();
                 } else {
@@ -3408,6 +4351,7 @@ var StableWebRTCModule = (() => {
                 }
                 var answer_modified = remove_all_ice_candidates(answer_json.sdp);
                 connection.pc.setLocalDescription(new RTCSessionDescription({ type: "answer", sdp: answer_modified })).then(function() {
+                  if (!pc_alive()) return;
                   if (connection.local_support_trickle_ice == null) {
                     connection.local_support_trickle_ice = is_support_trickle_ice(connection.pc.localDescription.sdp);
                   }
@@ -3430,6 +4374,10 @@ var StableWebRTCModule = (() => {
                       });
                     });
                   }
+                  var _msg = error && error.message ? String(error.message) : String(error);
+                  if (/SCTP/i.test(_msg)) {
+                    ev.emit("log", "FATAL-FOR-DATA: pc SCTP transport wedged (" + _msg + ") \u2014 this pc will fail all future data-channel answers; peer recreation required");
+                  }
                   ev.emit("error", error);
                 });
               } else {
@@ -3447,7 +4395,9 @@ var StableWebRTCModule = (() => {
             });
           }
         }, applyRemoteOffer = function() {
+          if (!pc_alive()) return;
           connection.pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: connection.pending_remote_offer_sdp })).then(function() {
+            if (!pc_alive()) return;
             drain_pending_remote_candidates();
             if (this_seq_remote_offer == connection.seq_remote_offer) {
               create_answer();
@@ -3466,6 +4416,11 @@ var StableWebRTCModule = (() => {
           });
         };
         if (connection.negotiation_state !== 0 && connection.negotiation_state !== 2 && connection.negotiation_state !== 5) {
+          return;
+        }
+        if (connection.negotiation_state === 2 && !opening_phase() && politeness() === false) {
+          _engine_diag("RULE-B: impolite \u2014 ignoring incoming offer while ours is in flight (peer will rollback & answer)");
+          connection.pending_remote_offer_sdp = null;
           return;
         }
         var pre_state = connection.negotiation_state;
@@ -3490,7 +4445,25 @@ var StableWebRTCModule = (() => {
       if (seq_offer > connection.seq_remote_offer) {
         connection.seq_remote_offer = seq_offer;
         connection.pending_remote_offer_sdp = null;
-        var base_remote_polite = connection.remote_nonce > connection.local_nonce;
+        var base_remote_polite;
+        if (connection.remote_nonce !== connection.local_nonce) {
+          base_remote_polite = connection.remote_nonce > connection.local_nonce;
+        } else {
+          base_remote_polite = false;
+          var tie_remote_fp = get_fingerprint_from_sdp(sdp);
+          var tie_local_fp = connection.local_fingerprint;
+          if (tie_local_fp == null && connection.pc && connection.pc.localDescription && connection.pc.localDescription.sdp) {
+            tie_local_fp = get_fingerprint_from_sdp(connection.pc.localDescription.sdp);
+          }
+          if (tie_remote_fp && tie_local_fp) {
+            for (var fb = 0; fb < tie_remote_fp.length && fb < tie_local_fp.length; fb++) {
+              if (tie_remote_fp[fb] !== tie_local_fp[fb]) {
+                base_remote_polite = tie_remote_fp[fb] > tie_local_fp[fb];
+                break;
+              }
+            }
+          }
+        }
         var even_epoch = connection.epoch_negotiation_success % 2 === 0;
         var polite_now = even_epoch ? base_remote_polite : !base_remote_polite;
         if (connection.negotiation_state == 0 || polite_now == true) {
@@ -3768,7 +4741,8 @@ var StableWebRTCModule = (() => {
       }
     }
     function create_offer() {
-      if (connection.pc && connection.pc.connectionState !== "closed") {
+      _engine_diag("create_offer: alive=" + pc_alive() + " neg=" + connection.negotiation_state + " sigState=" + (connection.pc ? connection.pc.signalingState : "-") + " rollback=" + connection.making_rollback);
+      if (pc_alive()) {
         if (connection.negotiation_state == 0 && connection.pc.signalingState !== "have-remote-offer" && connection.making_rollback == false) {
           set_connection_state({
             negotiation_state: 1
@@ -3779,9 +4753,14 @@ var StableWebRTCModule = (() => {
           if (connection.need_ice_restart == true) {
             offer_options.iceRestart = true;
           }
+          if (connection.pc.sctp == null || connection.pc.sctp.state !== "connected") {
+            if (connection.list_data_channels.length == 0) {
+              create_data_channel(false);
+            }
+          }
           ensure_transceivers_for_sending();
           connection.pc.createOffer(offer_options).then(function(offer) {
-            if (connection.negotiation_state == 1 && connection.pc.signalingState !== "have-remote-offer" && this_offer_for_seq == connection.local_offer_history.length) {
+            if (pc_alive() && connection.negotiation_state == 1 && connection.pc.signalingState !== "have-remote-offer" && this_offer_for_seq == connection.local_offer_history.length) {
               if ("toJSON" in offer && typeof offer.toJSON == "function") {
                 var offer_json = offer.toJSON();
               } else {
@@ -3789,6 +4768,7 @@ var StableWebRTCModule = (() => {
               }
               var offer_modified = remove_all_ice_candidates(offer_json.sdp);
               connection.pc.setLocalDescription(new RTCSessionDescription({ type: "offer", sdp: offer_modified })).then(function() {
+                if (!pc_alive()) return;
                 if (connection.local_support_trickle_ice == null) {
                   connection.local_support_trickle_ice = is_support_trickle_ice(connection.pc.localDescription.sdp);
                 }
@@ -3799,11 +4779,12 @@ var StableWebRTCModule = (() => {
                   clearTimeout(connection.wait_for_answer_timeout_timer);
                   connection.wait_for_answer_timeout_timer = null;
                   var max_wait_time = 7e3;
-                  for (var i in connection.local_offer_history) {
-                    if (connection.local_offer_history[i][1] > 0) {
-                      var time_to_get_answer = connection.local_offer_history[i][1] - connection.local_offer_history[i][0];
-                      if (time_to_get_answer + 2 > max_wait_time) {
-                        max_wait_time = time_to_get_answer + 2;
+                  var hist_start = Math.max(0, connection.local_offer_history.length - 32);
+                  for (var hi = hist_start; hi < connection.local_offer_history.length; hi++) {
+                    if (connection.local_offer_history[hi][1] > 0) {
+                      var time_to_get_answer = connection.local_offer_history[hi][1] - connection.local_offer_history[hi][0];
+                      if (time_to_get_answer + 2e3 > max_wait_time) {
+                        max_wait_time = time_to_get_answer + 2e3;
                       }
                     }
                   }
@@ -3854,9 +4835,9 @@ var StableWebRTCModule = (() => {
         }
       }
     }
-    function send_faild_decompress(type, seq) {
-      var uint8buffer = litepack_default.encode(SCHEMA_FAILD_DECOMPRESS, { failed_type: type, seq });
-      send_signal(MSGCODE_TYPE_MAP["FAILD_DECOMPRESS"], uint8buffer);
+    function send_failed_decompress(type, seq) {
+      var uint8buffer = litepack_default.encode(SCHEMA_FAILED_DECOMPRESS, { failed_type: type, seq });
+      send_signal(MSGCODE_TYPE_MAP["FAILED_DECOMPRESS"], uint8buffer);
     }
     function chunk_limit_internal() {
       var mms = 900;
@@ -3866,17 +4847,19 @@ var StableWebRTCModule = (() => {
       return Math.min(connection.max_signal_chunk_size, mms);
     }
     function send_signal(type, data) {
-      var data_channel_open = connection.data_channel_primary_index !== null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState == "open" && connection.data_channel_state == "open";
+      var ice_state = connection.pc ? connection.pc.iceConnectionState : null;
+      var transport_down = ice_state === "disconnected" || ice_state === "failed";
+      var data_channel_open = transport_down === false && connection.data_channel_primary_index !== null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState == "open" && connection.data_channel_state == "open";
       if (data_channel_open == true) {
         var uint8buffer = litepack_default.encode(SCHEMA_DC_MSG, { type, data: data instanceof Uint8Array ? data : toU82(data) });
         var ilimit = chunk_limit_internal();
         if (uint8buffer.byteLength <= ilimit) {
-          data_channel_send(uint8buffer);
+          data_channel_send_signal(uint8buffer);
         } else {
           var mid_i = connection.chunk_send_id_internal = connection.chunk_send_id_internal + 1 & 65535;
           var pieces_i = build_chunks(uint8buffer, ilimit, mid_i);
           for (var pi = 0; pi < pieces_i.length; pi++) {
-            data_channel_send(litepack_default.encode(SCHEMA_DC_MSG, { type: MSGCODE_TYPE_MAP["SIGNAL_CHUNK"], data: pieces_i[pi] }));
+            data_channel_send_signal(litepack_default.encode(SCHEMA_DC_MSG, { type: MSGCODE_TYPE_MAP["SIGNAL_CHUNK"], data: pieces_i[pi] }));
           }
         }
       } else {
@@ -3908,11 +4891,11 @@ var StableWebRTCModule = (() => {
                     if (!err && murmurhash3_str(sdp) == b.result_hash) {
                       process_income_offer(sdp, seq);
                     } else {
-                      send_faild_decompress(type, seq);
+                      send_failed_decompress(type, seq);
                     }
                   });
                 } else {
-                  send_faild_decompress(type, seq);
+                  send_failed_decompress(type, seq);
                 }
               });
             } else {
@@ -3920,12 +4903,12 @@ var StableWebRTCModule = (() => {
                 if (!err && murmurhash3_str(sdp) == b.result_hash) {
                   process_income_offer(sdp, seq);
                 } else {
-                  send_faild_decompress(type, seq);
+                  send_failed_decompress(type, seq);
                 }
               });
             }
           } else {
-            send_faild_decompress(type, seq);
+            send_failed_decompress(type, seq);
           }
         } else {
           var b = litepack_default.decode(SCHEMA_SEQ_PAYLOAD, data);
@@ -3939,7 +4922,7 @@ var StableWebRTCModule = (() => {
               if (result !== null) {
                 process_income_offer(result, seq);
               } else {
-                send_faild_decompress(type, seq);
+                send_failed_decompress(type, seq);
               }
             });
           }
@@ -3956,11 +4939,11 @@ var StableWebRTCModule = (() => {
                     if (!err && murmurhash3_str(sdp) == b.result_hash) {
                       process_income_answer(sdp, seq);
                     } else {
-                      send_faild_decompress(type, seq);
+                      send_failed_decompress(type, seq);
                     }
                   });
                 } else {
-                  send_faild_decompress(type, seq);
+                  send_failed_decompress(type, seq);
                 }
               });
             } else {
@@ -3968,12 +4951,12 @@ var StableWebRTCModule = (() => {
                 if (!err && murmurhash3_str(sdp) == b.result_hash) {
                   process_income_answer(sdp, seq);
                 } else {
-                  send_faild_decompress(type, seq);
+                  send_failed_decompress(type, seq);
                 }
               });
             }
           } else {
-            send_faild_decompress(type, seq);
+            send_failed_decompress(type, seq);
           }
         } else {
           var b = litepack_default.decode(SCHEMA_SEQ_PAYLOAD, data);
@@ -3987,7 +4970,7 @@ var StableWebRTCModule = (() => {
               if (result !== null) {
                 process_income_answer(result, seq);
               } else {
-                send_faild_decompress(type, seq);
+                send_failed_decompress(type, seq);
               }
             });
           }
@@ -4035,8 +5018,8 @@ var StableWebRTCModule = (() => {
           }
         } catch (error) {
         }
-      } else if (type == MSGCODE_TYPE_MAP["FAILD_DECOMPRESS"]) {
-        var b = litepack_default.decode(SCHEMA_FAILD_DECOMPRESS, data);
+      } else if (type == MSGCODE_TYPE_MAP["FAILED_DECOMPRESS"]) {
+        var b = litepack_default.decode(SCHEMA_FAILED_DECOMPRESS, data);
         var seq = b.seq;
         if (b.failed_type >= MSGCODE_TYPE_MAP["OFFER_RAW"] && b.failed_type <= MSGCODE_TYPE_MAP["OFFER_DIFF_DEFLATE"]) {
           if (seq == connection.local_offer_history.length) {
@@ -4052,29 +5035,65 @@ var StableWebRTCModule = (() => {
           }
         }
       } else if (type == MSGCODE_TYPE_MAP["PING"]) {
+        try {
+          var pingb = litepack_default.decode(SCHEMA_PING, data);
+          send_signal(MSGCODE_TYPE_MAP["PONG"], litepack_default.encode(SCHEMA_PING, { timestamp: pingb.timestamp }));
+        } catch (error) {
+        }
+      } else if (type == MSGCODE_TYPE_MAP["PONG"]) {
+        try {
+          var pongb = litepack_default.decode(SCHEMA_PING, data);
+          var rtt = Date.now() - pongb.timestamp;
+          if (rtt >= 0 && rtt < 6e5) {
+            connection.current_ping_rtt = rtt;
+            ev.emit("rtt", rtt);
+          }
+        } catch (error) {
+        }
       }
     }
     function on_signal_channel(data) {
-      var _frame = litepack_default.decode(SCHEMA_SIGNAL_FRAME, data);
-      var envBytes;
-      if (_frame.kind === 1) {
-        envBytes = reassemble_chunk(_frame.body, connection.chunk_reasm_external);
-        if (envBytes === null) return;
-      } else {
-        envBytes = _frame.body;
-      }
-      var _env = litepack_default.decode(SCHEMA_SIGNAL_ENVELOPE, envBytes);
-      if (_env.checksum == murmurhash3_data(_env.payload)) {
-        var _inn = litepack_default.decode(SCHEMA_SIGNAL_INNER, _env.payload);
-        if (connection.remote_nonce == 0 && _inn.local_nonce > 0) {
-          connection.remote_nonce = _inn.local_nonce;
-        }
-        var sctp_not_ready = !connection.pc || !connection.pc.sctp || !connection.pc.sctp.maxChannels || connection.pc.sctp.maxMessageSize === Infinity || !connection.pc.sctp.maxMessageSize;
-        if (_inn.local_nonce == connection.remote_nonce && (_inn.remote_nonce == 0 && sctp_not_ready || _inn.remote_nonce == connection.local_nonce)) {
-          process_income_signal(_inn.type, _inn.data);
+      try {
+        var _frame = litepack_default.decode(SCHEMA_SIGNAL_FRAME, data);
+        var envBytes;
+        if (_frame.kind === 1) {
+          envBytes = reassemble_chunk(_frame.body, connection.chunk_reasm_external);
+          if (envBytes === null) return;
         } else {
+          envBytes = _frame.body;
         }
-      } else {
+        var _env = litepack_default.decode(SCHEMA_SIGNAL_ENVELOPE, envBytes);
+        if (_env.checksum == murmurhash3_data(_env.payload)) {
+          var _inn = litepack_default.decode(SCHEMA_SIGNAL_INNER, _env.payload);
+          if (connection.remote_nonce == 0 && _inn.local_nonce > 0) {
+            connection.remote_nonce = _inn.local_nonce;
+          }
+          var sctp_not_ready = !connection.pc || !connection.pc.sctp || !connection.pc.sctp.maxChannels || connection.pc.sctp.maxMessageSize === Infinity || !connection.pc.sctp.maxMessageSize;
+          if (_inn.local_nonce == connection.remote_nonce && (_inn.remote_nonce == 0 && sctp_not_ready || _inn.remote_nonce == connection.local_nonce)) {
+            connection.nonce_mismatch_streak_count = 0;
+            connection.nonce_mismatch_streak_nonce = 0;
+            process_income_signal(_inn.type, _inn.data);
+          } else {
+            if (_inn.local_nonce > 0 && _inn.local_nonce !== connection.remote_nonce) {
+              if (connection.nonce_mismatch_streak_nonce === _inn.local_nonce) {
+                connection.nonce_mismatch_streak_count++;
+              } else {
+                connection.nonce_mismatch_streak_nonce = _inn.local_nonce;
+                connection.nonce_mismatch_streak_count = 1;
+              }
+              if (connection.nonce_mismatch_streak_count >= connection.nonce_mismatch_close_threshold) {
+                ev.emit("error", "remote peer appears to have restarted (a new session nonce arrived " + connection.nonce_mismatch_streak_count + " times in a row) \u2014 closing this connection; create a new instance to reconnect");
+                close_connection();
+                return;
+              }
+            }
+            report_malformed_frame("signal/nonce", "nonce mismatch");
+          }
+        } else {
+          report_malformed_frame("signal/checksum", "checksum mismatch");
+        }
+      } catch (error) {
+        report_malformed_frame("signal", error);
       }
     }
     function update_all_mediastream_receivers() {
@@ -4131,14 +5150,15 @@ var StableWebRTCModule = (() => {
           audio_bitrate: 0,
           audio_packet_loss: 0,
           audio_jitter: 0,
-          // Internal delta tracking
+          // Internal delta tracking — per-kind timestamps (see the sending record)
           _prev_video_bytes_received: 0,
           _prev_audio_bytes_received: 0,
           _prev_video_packets_lost: 0,
           _prev_video_packets_received: 0,
           _prev_audio_packets_lost: 0,
           _prev_audio_packets_received: 0,
-          _prev_stats_time: 0
+          _prev_video_stats_time: 0,
+          _prev_audio_stats_time: 0
         };
       }
       var rec = connection.list_receiving_live_mediastream[tag_id];
@@ -4172,8 +5192,8 @@ var StableWebRTCModule = (() => {
         if ("video_track" in options) {
           if (rec.video_track == null && options.video_track !== null || rec.video_track !== null && options.video_track == null || isTrackEqual(rec.video_track, options.video_track) == false) {
             var all_video_tracks = rec.mediastream.getVideoTracks();
-            for (var i in all_video_tracks) {
-              rec.mediastream.removeTrack(all_video_tracks[i]);
+            for (var vi = 0; vi < all_video_tracks.length; vi++) {
+              rec.mediastream.removeTrack(all_video_tracks[vi]);
             }
             if (options.video_track !== null) {
               rec.mediastream.addTrack(options.video_track);
@@ -4185,8 +5205,8 @@ var StableWebRTCModule = (() => {
         if ("audio_track" in options) {
           if (rec.audio_track == null && options.audio_track !== null || rec.audio_track !== null && options.audio_track == null || isTrackEqual(rec.audio_track, options.audio_track) == false) {
             var all_audio_tracks = rec.mediastream.getAudioTracks();
-            for (var i in all_audio_tracks) {
-              rec.mediastream.removeTrack(all_audio_tracks[i]);
+            for (var ai = 0; ai < all_audio_tracks.length; ai++) {
+              rec.mediastream.removeTrack(all_audio_tracks[ai]);
             }
             if (options.audio_track !== null) {
               rec.mediastream.addTrack(options.audio_track);
@@ -4277,6 +5297,7 @@ var StableWebRTCModule = (() => {
     function remove_unused_tracks() {
       clearTimeout(connection.remove_unused_tracks_timer);
       connection.remove_unused_tracks_timer = null;
+      if (!pc_alive()) return;
       var used = /* @__PURE__ */ Object.create(null), k2, rec;
       for (k2 in connection.list_sending_live_mediastream) {
         rec = connection.list_sending_live_mediastream[k2];
@@ -4586,10 +5607,14 @@ var StableWebRTCModule = (() => {
           audio_active: false,
           audio_bitrate: 0,
           audio_mime_type: null,
-          // Internal delta tracking
+          // Internal delta tracking — timestamps are PER KIND: video and audio
+          // stats arrive as separate reports in the same getStats pass, and a
+          // shared timestamp let whichever ran second compute its bitrate delta
+          // against the other's clock reading.
           _prev_video_bytes_sent: 0,
           _prev_audio_bytes_sent: 0,
-          _prev_stats_time: 0,
+          _prev_video_stats_time: 0,
+          _prev_audio_stats_time: 0,
           max_video_fps: 0,
           max_video_bitrate: 0,
           video_scale_down: 1,
@@ -4656,12 +5681,12 @@ var StableWebRTCModule = (() => {
         var video_track = null;
         var audio_track = null;
         var all_tracks = stream2.getTracks();
-        for (var i in all_tracks) {
-          if (video_track == null && all_tracks[i].kind == "video") {
-            video_track = all_tracks[i];
+        for (var ti = 0; ti < all_tracks.length; ti++) {
+          if (video_track == null && all_tracks[ti].kind == "video") {
+            video_track = all_tracks[ti];
           }
-          if (audio_track == null && all_tracks[i].kind == "audio") {
-            audio_track = all_tracks[i];
+          if (audio_track == null && all_tracks[ti].kind == "audio") {
+            audio_track = all_tracks[ti];
           }
         }
         set_sending_stream(for_tag_id, {
@@ -4772,7 +5797,7 @@ var StableWebRTCModule = (() => {
       if (connection.pc.localDescription && connection.pc.localDescription.type) {
         var current_local_ufrag = get_ufrag_from_sdp(connection.pc.localDescription.sdp);
         if (current_local_ufrag) {
-          var candidates = connection.list_gathered_local_candidates[current_local_ufrag];
+          var candidates = connection.list_gathered_local_candidates[current_local_ufrag] || [];
           var list_ipv6 = [];
           var list_ipv4 = [];
           var relay_ipv6 = [];
@@ -4786,8 +5811,8 @@ var StableWebRTCModule = (() => {
           var host_ipv4 = [];
           var public_host = false;
           var map_local_to_srflx = /* @__PURE__ */ new Map();
-          for (var i in candidates) {
-            var candidate = candidates[i];
+          for (var ci = 0; ci < candidates.length; ci++) {
+            var candidate = candidates[ci];
             if (!candidate) continue;
             var cand_str = candidate.candidate || "";
             var address = candidate.address || "";
@@ -4895,109 +5920,250 @@ var StableWebRTCModule = (() => {
         }
       }
     }
+    var QUEUE_COMPACT_THRESHOLD = 4096;
+    var SENDS_MAX_PER_TICK = 512;
+    function data_queue_length() {
+      return connection.data_channel_sending_messages_queue.length - connection.data_q_head;
+    }
+    function signal_queue_length() {
+      return connection.signal_sending_messages_queue.length - connection.signal_q_head;
+    }
+    function compact_data_queue() {
+      if (connection.data_q_head >= QUEUE_COMPACT_THRESHOLD) {
+        connection.data_channel_sending_messages_queue.splice(0, connection.data_q_head);
+        connection.data_q_head = 0;
+      }
+    }
+    function compact_signal_queue() {
+      if (connection.signal_q_head >= QUEUE_COMPACT_THRESHOLD) {
+        connection.signal_sending_messages_queue.splice(0, connection.signal_q_head);
+        connection.signal_q_head = 0;
+      }
+    }
     function data_channel_get_send_rate() {
       var now = Date.now();
       var cutoff = now - 1e3;
-      while (connection.data_channel_sent_events.length && connection.data_channel_sent_events[0][0] < cutoff) {
-        connection.data_channel_sent_events.shift();
+      var evs = connection.data_channel_sent_events;
+      while (connection.sent_events_head < evs.length && evs[connection.sent_events_head][0] < cutoff) {
+        connection.sent_window_bytes -= evs[connection.sent_events_head][1];
+        connection.sent_window_count--;
+        connection.sent_events_head++;
       }
-      var sent_count = connection.data_channel_sent_events.length;
-      var sent_bytes = 0;
-      for (var i = 0; i < sent_count; i++) {
-        sent_bytes += connection.data_channel_sent_events[i][1];
+      if (connection.sent_events_head >= QUEUE_COMPACT_THRESHOLD) {
+        evs.splice(0, connection.sent_events_head);
+        connection.sent_events_head = 0;
       }
-      return [sent_count, sent_bytes];
+      return [connection.sent_window_count, connection.sent_window_bytes];
+    }
+    function rate_limits_active() {
+      return connection.data_channel_max_sending_messages_per_sec !== Infinity || connection.data_channel_max_sending_bytes_per_sec !== Infinity;
     }
     function data_channel_schedule_pump() {
-      if (connection.data_channel_sending_messages_paused == false) {
-        if (connection.data_channel_pump_queue_timer == null) {
-          if (connection.data_channel_sending_messages_queue.length > 0) {
-            var [sent_count, sent_bytes] = data_channel_get_send_rate();
-            var wait_time = 0;
-            var now = Date.now();
-            if (sent_count >= connection.data_channel_max_sending_messages_per_sec) {
-              var oldest_ts = connection.data_channel_sent_events[0][0];
-              wait_time = Math.max(wait_time, 1e3 - (now - oldest_ts));
-            }
-            if (sent_bytes >= connection.data_channel_max_sending_bytes_per_sec && sent_count > 0) {
-              var sumFwd = sent_bytes;
-              var j = 0;
-              while (j < sent_count && sumFwd > connection.data_channel_max_sending_bytes_per_sec) {
-                sumFwd -= connection.data_channel_sent_events[j][1];
-                j++;
-              }
-              var ts_to_expire = connection.data_channel_sent_events[j - 1 >= 0 ? j - 1 : 0][0];
-              var w = 1e3 - (now - ts_to_expire);
-              if (w > wait_time) {
-                wait_time = w;
-              }
-            }
-            if (wait_time < 0) {
-              wait_time = 0;
-            }
-            if (wait_time > 60) {
-              wait_time = 60;
-            }
-            if (wait_time <= 0) {
-              var data_channel_open = connection.data_channel_primary_index !== null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState == "open" && connection.data_channel_state == "open";
-              if (data_channel_open == true) {
-                if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + connection.data_channel_sending_messages_queue[0].data.byteLength > connection.data_channel_min_buffered_amount) {
-                  wait_time = 10;
-                }
-              } else {
-                wait_time = 20;
-              }
-            }
-            connection.data_channel_pump_queue_timer = setTimeout(function() {
-              connection.data_channel_pump_queue_timer = null;
-              data_channel_pump_queue();
-            }, wait_time);
+      if (connection.data_channel_pump_queue_timer !== null) return;
+      var has_signal = signal_queue_length() > 0;
+      var has_data = data_queue_length() > 0;
+      if (!has_signal && !has_data) return;
+      var wait_time = 0;
+      var now = Date.now();
+      if (!has_signal && rate_limits_active()) {
+        var [sent_count, sent_bytes] = data_channel_get_send_rate();
+        if (sent_count >= connection.data_channel_max_sending_messages_per_sec) {
+          var oldest_ts = connection.data_channel_sent_events[0][0];
+          wait_time = Math.max(wait_time, 1e3 - (now - oldest_ts));
+        }
+        if (sent_bytes >= connection.data_channel_max_sending_bytes_per_sec && sent_count > 0) {
+          var sumFwd = sent_bytes;
+          var j = 0;
+          while (j < sent_count && sumFwd > connection.data_channel_max_sending_bytes_per_sec) {
+            sumFwd -= connection.data_channel_sent_events[j][1];
+            j++;
+          }
+          var ts_to_expire = connection.data_channel_sent_events[j - 1 >= 0 ? j - 1 : 0][0];
+          var w = 1e3 - (now - ts_to_expire);
+          if (w > wait_time) {
+            wait_time = w;
           }
         }
       }
+      if (wait_time < 0) {
+        wait_time = 0;
+      }
+      if (wait_time > 60) {
+        wait_time = 60;
+      }
+      if (wait_time <= 0) {
+        var data_channel_open = connection.data_channel_primary_index !== null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState == "open" && connection.data_channel_state == "open";
+        if (data_channel_open == true) {
+          var next_msg = has_signal ? connection.signal_sending_messages_queue[connection.signal_q_head] : connection.data_channel_sending_messages_queue[connection.data_q_head];
+          if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + next_msg.data.byteLength > connection.data_channel_max_buffered_amount) {
+            wait_time = 10;
+          }
+        } else {
+          wait_time = 20;
+        }
+      }
+      if (connection.data_channel_sending_messages_paused === true && !has_signal) {
+        wait_time = Math.max(wait_time, 250);
+      }
+      connection.data_channel_pump_queue_timer = setTimeout(function() {
+        connection.data_channel_pump_queue_timer = null;
+        data_channel_pump_queue();
+      }, wait_time);
+    }
+    var EXPIRE_MAX_PER_TICK = 4096;
+    function expire_queued_messages() {
+      var now = Date.now();
+      var budget = EXPIRE_MAX_PER_TICK;
+      var sq = connection.signal_sending_messages_queue;
+      while (budget > 0 && connection.signal_q_head < sq.length && now - sq[connection.signal_q_head].ts > connection.data_channel_max_queue_age) {
+        connection.signal_q_head++;
+        connection.stats_dropped_expired_signals++;
+        budget--;
+      }
+      compact_signal_queue();
+      var q = connection.data_channel_sending_messages_queue;
+      if (data_queue_length() == 0) return;
+      var expired = [];
+      while (budget > 0 && connection.data_q_head < q.length && now - q[connection.data_q_head].ts > connection.data_channel_max_queue_age) {
+        var ex = q[connection.data_q_head];
+        connection.data_q_head++;
+        connection.data_channel_queued_bytes -= ex.data.byteLength;
+        expired.push(ex);
+        budget--;
+      }
+      compact_data_queue();
+      if (expired.length == 0) return;
+      connection.stats_dropped_expired += expired.length;
+      for (var i = 0; i < expired.length; i++) {
+        if (typeof expired[i].callback == "function") {
+          try {
+            expired[i].callback(false);
+          } catch (cb_error) {
+            ev.emit("error", cb_error);
+          }
+        }
+      }
+      if (now - connection.last_expired_emit_ts >= 1e3) {
+        connection.last_expired_emit_ts = now;
+        ev.emit("error", "dropped " + expired.length + " queued message(s) still unsent after " + connection.data_channel_max_queue_age + "ms (" + connection.stats_dropped_expired + " total)");
+      }
     }
     function data_channel_pump_queue() {
-      var data_channel_open = connection.data_channel_primary_index !== null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState == "open" && connection.data_channel_state == "open";
-      if (data_channel_open == true) {
-        if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount < connection.data_channel_max_buffered_amount) {
+      expire_queued_messages();
+      function primary_dc_open() {
+        return connection.data_channel_primary_index !== null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState == "open" && connection.data_channel_state == "open";
+      }
+      if (primary_dc_open()) {
+        var sig_sent_this_tick = 0;
+        while (signal_queue_length() > 0) {
+          if (sig_sent_this_tick >= SENDS_MAX_PER_TICK) break;
+          if (!primary_dc_open()) break;
+          var sig_dc = connection.list_data_channels[connection.data_channel_primary_index];
+          var sig_data = connection.signal_sending_messages_queue[connection.signal_q_head].data;
+          if (sig_dc.bufferedAmount + sig_data.byteLength > connection.data_channel_max_buffered_amount) {
+            break;
+          }
+          try {
+            sig_dc.send(sig_data);
+            connection.signal_q_head++;
+            sig_sent_this_tick++;
+          } catch (error) {
+            connection.stats_send_failures++;
+            var sig_fail_now = Date.now();
+            if (sig_fail_now - connection.last_send_failure_emit_ts >= 1e3) {
+              connection.last_send_failure_emit_ts = sig_fail_now;
+              ev.emit("log", "datachannel send failed, message stays queued for retry (" + connection.stats_send_failures + " total): " + (error && error.message ? error.message : String(error)));
+            }
+            break;
+          }
+        }
+        compact_signal_queue();
+        if (connection.data_channel_sending_messages_paused === false && primary_dc_open() && connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount < connection.data_channel_max_buffered_amount) {
           var callbacks_sent_ok = [];
-          while (connection.data_channel_sending_messages_queue.length) {
-            data_channel_open = connection.data_channel_primary_index !== null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState == "open" && connection.data_channel_state == "open";
-            if (data_channel_open == true) {
-              var data_to_send = connection.data_channel_sending_messages_queue[0].data;
-              if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + data_to_send.byteLength > connection.data_channel_min_buffered_amount) {
-                break;
-              }
-              var [sent_count, sent_bytes] = data_channel_get_send_rate();
-              if (sent_count > connection.data_channel_max_sending_messages_per_sec || sent_bytes > connection.data_channel_max_sending_bytes_per_sec) {
-                break;
-              }
-              try {
-                var now = Date.now();
-                connection.list_data_channels[connection.data_channel_primary_index].send(data_to_send);
-                connection.data_channel_sent_events.push([now, data_to_send.byteLength]);
-                if (connection.data_channel_sending_messages_queue[0].callback !== null) {
-                  callbacks_sent_ok.push(connection.data_channel_sending_messages_queue[0].callback);
+          var sent_any_data = false;
+          var data_sent_this_tick = 0;
+          while (data_queue_length() > 0) {
+            if (data_sent_this_tick >= SENDS_MAX_PER_TICK) break;
+            if (!primary_dc_open()) break;
+            var head = connection.data_channel_sending_messages_queue[connection.data_q_head];
+            var data_to_send = head.data;
+            if (Date.now() - head.ts > connection.data_channel_max_queue_age) {
+              connection.data_q_head++;
+              connection.data_channel_queued_bytes -= data_to_send.byteLength;
+              connection.stats_dropped_expired++;
+              if (typeof head.callback == "function") {
+                try {
+                  head.callback(false);
+                } catch (cb_error) {
+                  ev.emit("error", cb_error);
                 }
-                connection.data_channel_sending_messages_queue.shift();
-              } catch (error) {
-                ev.emit("error", error);
               }
-              if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount >= connection.data_channel_max_buffered_amount) {
+              data_sent_this_tick++;
+              continue;
+            }
+            if (connection.pc && connection.pc.sctp && connection.pc.sctp.maxMessageSize > 0 && data_to_send.byteLength > connection.pc.sctp.maxMessageSize) {
+              connection.data_q_head++;
+              connection.data_channel_queued_bytes -= data_to_send.byteLength;
+              if (typeof head.callback == "function") {
+                try {
+                  head.callback(false);
+                } catch (cb_error) {
+                  ev.emit("error", cb_error);
+                }
+              }
+              ev.emit("error", "message must be less than " + connection.pc.sctp.maxMessageSize + " bytes (got " + data_to_send.byteLength + ")");
+              continue;
+            }
+            if (connection.list_data_channels[connection.data_channel_primary_index].bufferedAmount + data_to_send.byteLength > connection.data_channel_max_buffered_amount) {
+              break;
+            }
+            if (rate_limits_active()) {
+              var [sent_count, sent_bytes] = data_channel_get_send_rate();
+              if (sent_count >= connection.data_channel_max_sending_messages_per_sec || sent_bytes >= connection.data_channel_max_sending_bytes_per_sec) {
                 break;
               }
-            } else {
+            }
+            try {
+              var now = Date.now();
+              connection.list_data_channels[connection.data_channel_primary_index].send(data_to_send);
+              sent_any_data = true;
+              data_sent_this_tick++;
+              if (rate_limits_active()) {
+                connection.data_channel_sent_events.push([now, data_to_send.byteLength]);
+                connection.sent_window_count++;
+                connection.sent_window_bytes += data_to_send.byteLength;
+              }
+              if (head.callback !== null) {
+                callbacks_sent_ok.push(head.callback);
+              }
+              connection.data_q_head++;
+              connection.data_channel_queued_bytes -= data_to_send.byteLength;
+            } catch (error) {
+              connection.stats_send_failures++;
+              var fail_now = Date.now();
+              if (fail_now - connection.last_send_failure_emit_ts >= 1e3) {
+                connection.last_send_failure_emit_ts = fail_now;
+                ev.emit("log", "datachannel send failed, message stays queued for retry (" + connection.stats_send_failures + " total): " + (error && error.message ? error.message : String(error)));
+              }
               break;
             }
           }
           if (callbacks_sent_ok.length > 0) {
-            for (var i in callbacks_sent_ok) {
-              callbacks_sent_ok[i](true);
+            for (var ci = 0; ci < callbacks_sent_ok.length; ci++) {
+              try {
+                callbacks_sent_ok[ci](true);
+              } catch (cb_error) {
+                ev.emit("error", cb_error);
+              }
             }
+          }
+          compact_data_queue();
+          if (sent_any_data && data_queue_length() == 0) {
+            ev.emit("drain");
           }
         }
       }
-      if (connection.data_channel_sending_messages_queue.length > 0) {
+      if (signal_queue_length() > 0 || data_queue_length() > 0) {
         data_channel_schedule_pump();
       }
     }
@@ -5009,32 +6175,43 @@ var StableWebRTCModule = (() => {
       if (typeof data == "string") {
         data = _TE3.encode(data);
       }
-      if (connection.pc && connection.pc.sctp) {
-        var max_message_size = 900;
-        if ("maxMessageSize" in connection.pc.sctp && connection.pc.sctp.maxMessageSize > 0) {
-          max_message_size = connection.pc.sctp.maxMessageSize;
+      if (connection.pc && connection.pc.sctp && connection.pc.sctp.maxMessageSize > 0 && data.byteLength > connection.pc.sctp.maxMessageSize) {
+        if (typeof callback == "function") {
+          callback(false);
         }
-        if (max_message_size >= data.byteLength) {
-          if (typeof callback == "function") {
-            connection.data_channel_sending_messages_queue.push({
-              data,
-              callback
-            });
-          } else {
-            connection.data_channel_sending_messages_queue.push({
-              data,
-              callback: null
-            });
-          }
-          data_channel_schedule_pump();
-        } else {
-          if (typeof callback == "function") {
-            callback(false);
-          }
-          ev.emit("error", "message must be less then " + max_message_size + " bytes");
+        ev.emit("error", "message must be less than " + connection.pc.sctp.maxMessageSize + " bytes (got " + data.byteLength + ")");
+        return;
+      }
+      connection.data_channel_sending_messages_queue.push({
+        data,
+        callback: typeof callback == "function" ? callback : null,
+        ts: Date.now()
+      });
+      connection.data_channel_queued_bytes += data.byteLength;
+      data_channel_schedule_pump();
+    }
+    function data_channel_send_signal(data) {
+      connection.signal_sending_messages_queue.push({
+        data,
+        ts: Date.now()
+      });
+      if (connection.data_channel_pump_queue_timer !== null) {
+        clearTimeout(connection.data_channel_pump_queue_timer);
+        connection.data_channel_pump_queue_timer = null;
+      }
+      data_channel_schedule_pump();
+    }
+    function pause_sending() {
+      connection.data_channel_sending_messages_paused = true;
+    }
+    function resume_sending() {
+      if (connection.data_channel_sending_messages_paused === true) {
+        connection.data_channel_sending_messages_paused = false;
+        if (connection.data_channel_pump_queue_timer !== null) {
+          clearTimeout(connection.data_channel_pump_queue_timer);
+          connection.data_channel_pump_queue_timer = null;
         }
-      } else {
-        ev.emit("error", "no sctp yet");
+        data_channel_schedule_pump();
       }
     }
     function close_connection() {
@@ -5054,11 +6231,17 @@ var StableWebRTCModule = (() => {
       connection.remove_unused_tracks_timer = null;
       clearTimeout(connection.ice_restart_timer);
       connection.ice_restart_timer = null;
+      clearTimeout(connection.ice_restart_reset_timer);
+      connection.ice_restart_reset_timer = null;
       clearTimeout(connection.gathering_timeout_timer);
       connection.gathering_timeout_timer = null;
       clearTimeout(connection.mediastream_map_ack_timer);
       connection.mediastream_map_ack_timer = null;
       connection.mediastream_map_pending = null;
+      clearTimeout(connection.ping_timer);
+      connection.ping_timer = null;
+      clearTimeout(connection.liveness_timer);
+      connection.liveness_timer = null;
       connection.chunk_reasm_internal = {};
       connection.chunk_reasm_external = {};
       if (connection.pc) {
@@ -5071,7 +6254,7 @@ var StableWebRTCModule = (() => {
             }
           }
         }
-        for (var i in connection.list_data_channels) {
+        for (var i = 0; i < connection.list_data_channels.length; i++) {
           if (connection.list_data_channels[i] && connection.list_data_channels[i] !== null) {
             connection.list_data_channels[i].onopen = null;
             connection.list_data_channels[i].onmessage = null;
@@ -5106,6 +6289,26 @@ var StableWebRTCModule = (() => {
           }
         }
         connection.pc = null;
+        connection.data_channel_state = "closed";
+        connection.data_channel_primary_index = null;
+        connection.sctp = null;
+        connection.list_data_channels.length = 0;
+        connection.signal_sending_messages_queue.length = 0;
+        connection.signal_q_head = 0;
+        var pending = connection.data_channel_sending_messages_queue;
+        var pending_head = connection.data_q_head;
+        connection.data_channel_sending_messages_queue = [];
+        connection.data_q_head = 0;
+        connection.data_channel_queued_bytes = 0;
+        for (var qi = pending_head; qi < pending.length; qi++) {
+          if (typeof pending[qi].callback == "function") {
+            try {
+              pending[qi].callback(false);
+            } catch (cb_error) {
+              ev.emit("error", cb_error);
+            }
+          }
+        }
         ev.emit("close");
       }
     }
@@ -5156,6 +6359,51 @@ var StableWebRTCModule = (() => {
       }
       if ("gatheringMaxRetries" in opts2) {
         connection.gathering_max_retries = Math.max(0, opts2.gatheringMaxRetries | 0);
+      }
+      if ("ping" in opts2) {
+        connection.ping_enabled = opts2.ping !== false;
+        if (connection.ping_enabled === false && !("liveness" in opts2) && connection.liveness_enabled === true) {
+          connection.liveness_enabled = false;
+          setTimeout(function() {
+            ev.emit("log", "ping disabled \u2014 liveness watchdog auto-disabled with it (idle connections would falsely time out); pass liveness:true explicitly to keep it");
+          }, 0);
+        }
+      }
+      if ("pingIntervalMin" in opts2) {
+        connection.ping_interval_min = Math.max(100, opts2.pingIntervalMin | 0);
+      }
+      if ("pingIntervalMax" in opts2) {
+        connection.ping_interval_max = Math.max(connection.ping_interval_min, opts2.pingIntervalMax | 0);
+      }
+      if ("liveness" in opts2) {
+        connection.liveness_enabled = opts2.liveness !== false;
+      }
+      if ("livenessTimeout" in opts2) {
+        connection.liveness_timeout_ms = Math.max(2e3, opts2.livenessTimeout | 0);
+      }
+      if ("maxSendingMessagesPerSec" in opts2) {
+        connection.data_channel_max_sending_messages_per_sec = opts2.maxSendingMessagesPerSec === 0 ? Infinity : Math.max(1, opts2.maxSendingMessagesPerSec | 0);
+      }
+      if ("maxSendingBytesPerSec" in opts2) {
+        connection.data_channel_max_sending_bytes_per_sec = opts2.maxSendingBytesPerSec === 0 ? Infinity : Math.max(1024, opts2.maxSendingBytesPerSec | 0);
+      }
+      if ("minBufferedAmount" in opts2) {
+        connection.data_channel_min_buffered_amount = Math.max(1024, opts2.minBufferedAmount | 0);
+        for (var dci = 0; dci < connection.list_data_channels.length; dci++) {
+          var _dc = connection.list_data_channels[dci];
+          if (_dc) {
+            try {
+              _dc.bufferedAmountLowThreshold = connection.data_channel_min_buffered_amount;
+            } catch (e) {
+            }
+          }
+        }
+      }
+      if ("maxBufferedAmount" in opts2) {
+        connection.data_channel_max_buffered_amount = Math.max(connection.data_channel_min_buffered_amount, opts2.maxBufferedAmount | 0);
+      }
+      if ("maxQueueAge" in opts2) {
+        connection.data_channel_max_queue_age = Math.max(1e3, opts2.maxQueueAge | 0);
       }
       if (connection.pc) {
         connection.pc.setConfiguration(connection.pc_config);
@@ -5219,9 +6467,29 @@ var StableWebRTCModule = (() => {
           }
         };
         connection.pc.onicecandidateerror = function(event) {
-          if (event.errorCode >= 300 && event.errorCode <= 699) {
-          } else if (event.errorCode >= 700 && event.errorCode <= 799) {
+          var code = Number(event.errorCode) || 0;
+          var url = event.url || "unknown";
+          var text = event.errorText || "";
+          var key = url + "|" + code;
+          var rec = connection.ice_server_errors[key];
+          if (rec) {
+            rec.count++;
+            rec.last_ts = Date.now();
+            return;
+          }
+          connection.ice_server_errors[key] = {
+            url,
+            code,
+            text,
+            count: 1,
+            first_ts: Date.now(),
+            last_ts: Date.now()
+          };
+          var msg = "ICE " + (code === 701 ? "server unreachable" : "error " + code) + " from " + url + (text ? " (" + text + ")" : "");
+          if (code === 401 || code === 403 || code === 441 || code === 486 || code === 508) {
+            ev.emit("error", msg);
           } else {
+            ev.emit("log", msg);
           }
         };
         connection.pc.oniceconnectionstatechange = function() {
@@ -5236,7 +6504,15 @@ var StableWebRTCModule = (() => {
           if (state == "connected" || state == "completed") {
             clearTimeout(connection.ice_restart_timer);
             connection.ice_restart_timer = null;
-            connection.ice_restart_count = 0;
+            clearTimeout(connection.ice_restart_reset_timer);
+            connection.ice_restart_reset_timer = setTimeout(function() {
+              connection.ice_restart_reset_timer = null;
+              if (!pc_alive()) return;
+              var s = connection.pc.iceConnectionState;
+              if (s === "connected" || s === "completed") {
+                connection.ice_restart_count = 0;
+              }
+            }, connection.ice_restart_stable_window_ms);
             clearTimeout(connection.gathering_timeout_timer);
             connection.gathering_timeout_timer = null;
             connection.gathering_retry_count = 0;
@@ -5253,6 +6529,10 @@ var StableWebRTCModule = (() => {
             if (connection.ice_restart_count < connection.ice_restart_max_retries) {
               connection.ice_restart_count++;
               restartIce();
+            } else {
+              ev.emit("error", "ICE failed \u2014 closing after " + connection.ice_restart_max_retries + " restart attempts");
+              close_connection();
+              return;
             }
           }
           if (state == "disconnected") {
@@ -5266,6 +6546,9 @@ var StableWebRTCModule = (() => {
                   if (connection.ice_restart_count < connection.ice_restart_max_retries) {
                     connection.ice_restart_count++;
                     restartIce();
+                  } else {
+                    ev.emit("error", "ICE disconnected \u2014 closing after " + connection.ice_restart_max_retries + " restart attempts");
+                    close_connection();
                   }
                 }
               }, connection.ice_restart_delay_ms);
@@ -5283,7 +6566,7 @@ var StableWebRTCModule = (() => {
           ev.emit("statechange", build_state_snapshot());
         };
         connection.pc.onicegatheringstatechange = function(event) {
-          if (connection.pc && connection.pc.connectionState !== "closed") {
+          if (pc_alive()) {
             var gatherState = connection.pc.iceGatheringState;
             if (gatherState === "complete") {
               clearTimeout(connection.gathering_timeout_timer);
@@ -5321,8 +6604,11 @@ var StableWebRTCModule = (() => {
           ev.emit("statechange", build_state_snapshot());
         };
         connection.pc.onnegotiationneeded = function() {
+          _engine_diag("onnegotiationneeded: neg=" + connection.negotiation_state + " timer=" + (connection.create_offer_timer != null) + " \u2192 " + (connection.negotiation_state == 0 && connection.create_offer_timer == null ? "SCHEDULE" : "LATCH"));
           if (connection.negotiation_state == 0 && connection.create_offer_timer == null) {
             create_offer_schedule();
+          } else {
+            connection.renegotiation_pending = true;
           }
         };
         connection.pc.onsignalingstatechange = function() {
@@ -5343,7 +6629,7 @@ var StableWebRTCModule = (() => {
         } else {
           let try_create_dc = function() {
             connection.create_data_channel_timer = null;
-            if (connection.pc && connection.pc.connectionState !== "closed") {
+            if (pc_alive()) {
               var sctp_not_up = connection.pc.sctp == null || connection.pc.sctp.state !== "connected";
               var need_dc = sctp_not_up && connection.list_data_channels.length == 0 && connection.negotiation_state == 0 && connection.pending_remote_offer_sdp == null;
               if (need_dc) {
@@ -5377,6 +6663,8 @@ var StableWebRTCModule = (() => {
       removeTrack,
       send: data_channel_send_data,
       write: data_channel_send_data,
+      pause: pause_sending,
+      resume: resume_sending,
       set_auth_verified,
       setConfiguration,
       restartIce,
@@ -5452,6 +6740,25 @@ var StableWebRTCModule = (() => {
     Object.defineProperty(self2, "connected", {
       get: function() {
         return connection.data_channel_state === "open";
+      },
+      enumerable: true,
+      configurable: true
+    });
+    Object.defineProperty(self2, "paused", {
+      get: function() {
+        return connection.data_channel_sending_messages_paused === true;
+      },
+      enumerable: true,
+      configurable: true
+    });
+    Object.defineProperty(self2, "bufferedAmount", {
+      get: function() {
+        var total = connection.data_channel_queued_bytes;
+        var pidx = connection.data_channel_primary_index;
+        if (pidx !== null && connection.list_data_channels[pidx]) {
+          total += connection.list_data_channels[pidx].bufferedAmount || 0;
+        }
+        return total;
       },
       enumerable: true,
       configurable: true
