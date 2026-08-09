@@ -89,6 +89,13 @@ The native API forces you to manually relay offers, answers, and candidates thro
 ### Host candidates: connectivity vs. privacy, your choice
 By default, host candidates (containing local addresses like `192.168.x.x`) **are** sent — they're what lets two peers on the same machine or LAN find a direct local path, so dropping them silently breaks same-network connections. If you'd rather not expose internal network topology through your signaling relay, set `exclude_host_candidates: true` and only server-reflexive and relay candidates are transmitted. You choose the tradeoff explicitly instead of having connectivity quietly removed.
 
+There is a third option that isn't a tradeoff at all when the binding supports
+it: with `webrtc-server`, `mdns: { register: true }` conceals each host address
+behind a random `xxxxxxxx-....local` name instead of dropping the candidate.
+Your signaling relay never sees `192.168.x.x`, and the LAN path still connects —
+the remote peer resolves the name over multicast DNS on its own network. This is
+exactly what browsers do by default (draft-ietf-mmusic-mdns-ice-candidates).
+
 ### No end-of-candidates signal
 The native API fires `onicecandidate` with `null` when gathering completes, but there's no built-in way to tell the remote peer "I'm done sending candidates." The remote side has to guess using timeouts. `stable-webrtc` sends an explicit candidate count per ufrag, so the receiver knows exactly when all candidates have arrived and signals the ICE agent immediately.
 
@@ -96,7 +103,7 @@ The native API fires `onicecandidate` with `null` when gathering completes, but 
 Every `new RTCPeerConnection()` generates a fresh DTLS certificate if you don't provide one. This takes 50–200ms and blocks the constructor. If you're creating multiple connections (mesh network, reconnections), this adds up. `stable-webrtc` pre-generates a shared ECDSA P-256 certificate once and reuses it across all instances, with automatic renewal on expiry.
 
 ### Signaling has no integrity protection
-The native API trusts whatever you feed to `setRemoteDescription` and `addIceCandidate`. If your signaling transport corrupts a byte (UDP packet damage, WebSocket frame issue), the connection silently fails with an opaque error. `stable-webrtc` wraps every signaling message in a MurmurHash3 checksum — corrupt messages are dropped before they can poison the state machine. Nonce verification prevents stale or injected signals from being processed.
+The native API trusts whatever you feed to `setRemoteDescription` and `addIceCandidate`. If your signaling transport corrupts a byte (UDP packet damage, WebSocket frame issue), the connection silently fails with an opaque error. `stable-webrtc` wraps every signaling message in a MurmurHash3 checksum — corrupt messages are dropped before they can poison the state machine. Session nonces filter out stale frames, replays, and messages misrouted from another session. (This is *robustness* against accidents, not cryptographic security — an active attacker on your signaling path is defeated by the `fingerprints` identity-verification flow, see [Security](#security).)
 
 ---
 
@@ -120,10 +127,25 @@ The package ships as ES modules (`src/` split into focused modules; `index.js` i
 A prebuilt IIFE bundle for direct `<script>` use is produced by `npm run build:browser`.
 
 **Node.js requires a WebRTC binding:**
+```bash
+npm install webrtc-server
+```
 ```js
-import wrtc from '@roamhq/wrtc';
+import * as wrtc from 'webrtc-server';
 const peer = new StableWebRTC({ wrtc: wrtc });
 ```
+
+[`webrtc-server`](https://www.npmjs.com/package/webrtc-server) is a complete
+WebRTC stack in **pure JavaScript** — no native bindings, no build tools, no
+prebuilt binaries to go missing on your platform or Node version. It installs
+and runs anywhere Node does, including Alpine containers, ARM boards and
+serverless environments where native modules are a problem.
+
+It also brings NAT traversal a browser can't do on its own — see
+[Node.js NAT traversal](#nodejs-nat-traversal) below.
+
+Any W3C-compatible binding works, so a native one such as `@roamhq/wrtc`
+can be substituted if you prefer.
 
 > Dependencies: two tiny zero-dependency libraries — [`compact-delta`](https://www.npmjs.com/package/compact-delta) (SDP delta encoding) and [`litepack`](https://www.npmjs.com/package/litepack) (binary wire schemas).
 
@@ -178,11 +200,12 @@ Once the DataChannel is open, signaling messages (offers, answers, candidates) a
 
 ### Signal Integrity
 
-Every signaling message is wrapped with a MurmurHash3 checksum and the sender's nonce. On receipt:
+Every signaling message is wrapped with a MurmurHash3 checksum and the sender's session nonce. On receipt:
 - **Checksum mismatch** → message is silently dropped (corrupt or truncated in transit).
-- **Nonce mismatch** → message is silently dropped (prevents signal injection from a third party or a stale connection).
+- **Nonce mismatch** → message is silently dropped (a stale frame, a replay, or a message misrouted from another session).
+- **Consistent nonce mismatch streak** → the peer has restarted (page refresh, crash) and generated a fresh nonce that can never match again. After 5 consecutive frames carrying the same unfamiliar nonce, the library emits `error` and closes — create a new `StableWebRTC` instance to reconnect. Random junk never triggers this (it doesn't repeat the same nonce).
 
-This protects against unreliable transports (UDP, lossy WebSocket) and ensures only the intended peer's messages are processed.
+**Scope of this protection:** it defends against *accidents* — corruption, reordering, crossed sessions on unreliable transports (UDP, lossy WebSocket). It is **not** cryptographic: MurmurHash3 is a non-cryptographic hash and a 16-bit nonce is guessable, so an active attacker who controls your signaling path can forge frames. Defending against that attacker is what the DTLS `fingerprints` identity-verification flow is for (see [Security](#security)) — WebRTC's own encryption then guarantees the media/data path matches the verified identity.
 
 ### ICE Candidate Compression
 
@@ -197,6 +220,16 @@ By default **all** candidate types — including host candidates (local addresse
 The library's own signaling (offers, answers, candidates, stream maps) is split into chunks when a message exceeds the per-pipe size limit, then reassembled transparently on the other side — so oversized SDPs (simulcast, many codecs) never exceed a transport's message-size cap. This applies to **both** pipes: the external `signal` transport and the internal DataChannel (SCTP). The limit is `max_signal_chunk_size` (default **1 KB**); the internal pipe uses `min(max_signal_chunk_size, sctp.maxMessageSize)`. Reassembly is all-or-nothing with a lazy timeout — on the library's unreliable/unordered DataChannel a lost chunk just fails reassembly and the message-level logic re-sends. **Application data (`peer.send`) is never chunked** — that remains the developer's responsibility. Small messages travel with a single byte of overhead, so the common case pays almost nothing.
 
 Reassembly is bounded by defensive limits so a malformed or malicious stream can't exhaust memory: each chunk reserves **16 bytes** for its header (so the actual payload per chunk is `max_signal_chunk_size − 16`); partial reassemblies are dropped after **5 s** (`CHUNK_REASSEMBLY_TIMEOUT`); at most **16** partial messages may be in flight at once (`CHUNK_MAX_OPEN`); and any message claiming more than **65536** chunks (`CHUNK_MAX_TOTAL`) is rejected outright. These are internal constants — `max_signal_chunk_size` is the only one you configure.
+
+### Delivery Semantics
+
+The DataChannel is **unreliable and unordered by design** (`maxRetransmits: 0`, `ordered: false`) — datagram semantics, chosen for speed and to leave reliability decisions to the developer:
+
+- Messages can be **lost** (no retransmission) and can arrive **out of order**.
+- `send(data, callback)` settling `callback(true)` means the message was handed to SCTP — **not** that it arrived.
+- The library's own signaling survives this via its recovery machinery (answer timeouts, `FAILED_DECOMPRESS` raw-retransmit, `MEDIASTREAM_MAP` ACKs). Your app data gets no such layer.
+
+For use cases that need reliable, ordered delivery — file transfer, state sync that can't tolerate gaps — add sequencing + acknowledgment at the application layer, or send idempotent/self-contained datagrams (game state snapshots, telemetry) where a lost message is simply superseded by the next one.
 
 ### Reliable Stream Maps
 
@@ -234,15 +267,37 @@ If both peers create a DataChannel before the nonce exchange resolves roles (a r
 
 The library pre-generates a single ECDSA P-256 certificate and shares it across all `StableWebRTC` instances on the same page. This eliminates the ~50–200ms certificate generation latency that normally blocks each new `RTCPeerConnection`. The certificate is cached until expiry and regenerated automatically.
 
-### DataChannel Backpressure
+### Flow Control
 
-Bounded queues with dual quotas (messages and bytes), watermark-based pacing, and drain notifications keep DataChannels responsive under load. Configurable limits:
+Outgoing app data flows through three independent layers, innermost to outermost:
+
+**1. Buffer watermarks (always on).** The send pump fills SCTP's buffer up to the *high* watermark (`maxBufferedAmount`, default 1MB) and resumes when it drains to the *low* watermark (`minBufferedAmount`, default 64KB, via `onbufferedamountlow`). Classic high/low watermark pacing — the pipe stays full at link speed without unbounded buffering.
+
+**2. Rate limits (opt-in, default unlimited).** Two independent per-second caps, `0` = no cap:
 
 ```js
-connection.data_channel_max_sending_messages_per_sec  // default: 1000
-connection.data_channel_max_sending_bytes_per_sec     // default: 64KB
-connection.data_channel_min_buffered_amount           // default: 64KB
-connection.data_channel_max_buffered_amount           // default: 1MB
+var peer = new StableWebRTC({
+  maxSendingBytesPerSec: 0,      // default: 0 = unlimited
+  maxSendingMessagesPerSec: 0    // default: 0 = unlimited
+});
+
+// Tunable live, in both directions — takes effect on the very next send:
+peer.setConfiguration({ maxSendingBytesPerSec: 256 * 1024 });  // cap at 256KB/s
+peer.setConfiguration({ maxSendingBytesPerSec: 0 });           // lift the cap
+```
+
+**3. `pause()` / `resume()` (manual valve).** `peer.pause()` holds outgoing app data in the queue without sending; `peer.resume()` releases it. While paused, `send()` keeps accepting, inbound delivery continues, and messages still age out normally if held past `maxQueueAge`.
+
+**Priority lane for signaling.** The library's own signaling (offers, answers, candidates, ping/pong) travels in a separate queue drained *before* app data, exempt from the rate limits and from `pause()`. Your throttling can never starve negotiation, ICE restarts, or liveness — the only gate signaling respects is the SCTP buffer watermark itself.
+
+**Producer-side backpressure.** `send(data, callback)` settles `callback(true)` when the message is handed to SCTP, or `callback(false)` if it expired unsent (`maxQueueAge`, default 10s) or the connection closed. `peer.bufferedAmount` reports bytes accepted but not yet transmitted, and the `drain` event fires when the queue empties — the classic stop-writing / resume-writing pair:
+
+```js
+function write(chunk){
+  peer.send(chunk);
+  return peer.bufferedAmount < 4 * 1024 * 1024;   // false = back off
+}
+peer.on('drain', resumeWriting);
 ```
 
 ### Network Profiling
@@ -312,6 +367,57 @@ peer.on('streamstats', (tagId, direction, stats) => {
 
 ---
 
+## Node.js NAT traversal
+
+With `webrtc-server` as the binding, a Node peer gets two NAT-traversal
+capabilities the browser doesn't expose — both on by default for client-side
+(full ICE) peers, which is what `StableWebRTC` creates:
+
+**mDNS candidate resolution.** Browsers conceal their LAN addresses behind
+`.local` names. A Node peer that can't resolve them silently loses every
+same-network direct path — two people in one office end up relaying through
+the internet. `webrtc-server` resolves them the way a browser does, and can
+conceal its own addresses the same way (`mdns: { register: true }`).
+
+**Gateway-assisted candidates.** The stack asks the router for a UDP
+forwarding rule over UPnP-IGD, NAT-PMP or PCP, and advertises the external
+address as a server-reflexive candidate. Unlike a STUN mapping, a forwarding
+rule is reachable by **any** peer — it keeps working behind symmetric NAT,
+where classic reflexive candidates fail. This is the same NAT traversal
+qBittorrent and Syncthing enable by default, and it often means two home
+users connect **directly, with no STUN or TURN server involved at all**.
+
+```js
+import * as wrtc from 'webrtc-server';
+
+// Defaults are already right for a P2P client:
+const peer = new StableWebRTC({ wrtc });
+
+// Or be explicit:
+const peer2 = new StableWebRTC({
+  wrtc,
+  mdns: { register: true },                // conceal our host IPs too
+  portMapping: { description: 'MyApp' },   // what the router's UI shows
+});
+
+// Opt out entirely (e.g. a managed network that forbids UPnP):
+const peer3 = new StableWebRTC({ wrtc, portMapping: false });
+```
+
+Mappings carry finite, auto-renewed leases and are removed when the peer
+closes. CGNAT and double-NAT are detected up front, so no useless candidates
+are produced. Neither capability applies in the browser, where the platform
+handles mDNS itself and port mapping isn't available — passing these options
+in a browser build is simply a no-op.
+
+> Note that `needs_relay` from the [`networkprofile`](#network-profiling)
+> event is inferred from STUN reflexive behaviour alone. With gateway-assisted
+> candidates available, a `symmetric_nat: true` peer may still connect
+> directly — treat the hint as a reason to *prepare* TURN, not proof it's
+> required.
+
+---
+
 ## API Reference
 
 ### Constructor
@@ -323,7 +429,9 @@ var peer = new StableWebRTC(options);
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `iceServers` | Array | Google + Twilio STUN | ICE server configuration |
-| `wrtc` | Object | — | Node.js only: WebRTC bindings (`@roamhq/wrtc`) |
+| `wrtc` | Object | — | Node.js only: WebRTC bindings. [`webrtc-server`](https://www.npmjs.com/package/webrtc-server) (pure JS, recommended) or any W3C-compatible binding |
+| `mdns` | Boolean \| Object | auto | Passed through to the binding. `webrtc-server`: resolve peers' concealed `.local` candidates; `{ register: true }` conceals your own host addresses. See [Node.js NAT traversal](#nodejs-nat-traversal) |
+| `portMapping` | Boolean \| Object | auto | Passed through to the binding. `webrtc-server`: UPnP/NAT-PMP/PCP gateway-assisted candidates. `{ description: 'MyApp' }` labels the rule in the router UI |
 | `exclude_host_candidates` | Boolean | `false` | If `true`, host candidates aren't sent (privacy; breaks same-LAN direct paths) |
 | `max_signal_chunk_size` | Number | `1024` | Max bytes per signaling message before chunking (both pipes) |
 | `gatheringTimeout` | Number | — | ms before a stuck ICE-gathering triggers a retry |
@@ -333,12 +441,23 @@ var peer = new StableWebRTC(options);
 | `portRange` | Object | — | Restrict local port range (where supported) |
 | `bundlePolicy` | String | `'balanced'` | BUNDLE policy (`'balanced'`, `'max-bundle'`, `'max-compat'`) |
 | `rtcpMuxPolicy` | String | `'require'` | RTCP mux policy |
+| `maxSendingBytesPerSec` | Number | `0` (unlimited) | Opt-in cap on outgoing app-data bytes/sec. `0` = no cap. Live-tunable via `setConfiguration` |
+| `maxSendingMessagesPerSec` | Number | `0` (unlimited) | Opt-in cap on outgoing app-data messages/sec. `0` = no cap. Live-tunable |
+| `minBufferedAmount` | Number | `64KB` | LOW watermark — sending resumes when SCTP's buffer drains to this |
+| `maxBufferedAmount` | Number | `1MB` | HIGH watermark — the pump fills SCTP's buffer up to this |
+| `maxQueueAge` | Number | `10000` | ms a queued message may wait unsent before it's dropped and its callback settled as failed (min 1000) |
+| `ping` | Boolean | `true` | App-level ping/pong RTT probe + keepalive over the DataChannel. `ping:false` also auto-disables `liveness` unless it's set explicitly |
+| `pingIntervalMin` / `pingIntervalMax` | Number | `1000` / `3000` | Randomised ping interval bounds (ms) |
+| `liveness` | Boolean | `true` | Watchdog: declares the link dead after `livenessTimeout` ms with no inbound traffic (crucial for ICE-lite peers) |
+| `livenessTimeout` | Number | `10000` | ms of inbound silence before recovery/close (min 2000) |
 
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `peer.connected` | Boolean | `true` when DataChannel is open and ready |
+| `peer.paused` | Boolean | `true` while the outgoing app-data valve is closed (see `pause()`) |
+| `peer.bufferedAmount` | Number | Bytes of app data accepted by `send()` but not yet handed to the network (library queue + SCTP buffer). Pair with the `drain` event for backpressure |
 | `peer.connection` | Object | Internal connection state (for advanced inspection) |
 
 ### Methods
@@ -346,8 +465,10 @@ var peer = new StableWebRTC(options);
 | Method | Description |
 |--------|-------------|
 | `peer.signal(data)` | Feed signaling data received from the remote peer |
-| `peer.send(data)` | Send data over DataChannel. Accepts `String`, `Uint8Array`, or `ArrayBuffer` |
-| `peer.write(data)` | Alias of `send` |
+| `peer.send(data, callback?)` | Send data over the DataChannel. Accepts `String`, `Uint8Array`, or `ArrayBuffer`. `callback(ok)`: `true` = handed to SCTP, `false` = expired unsent or connection closed. See [Delivery Semantics](#delivery-semantics) |
+| `peer.write(data, callback?)` | Alias of `send` |
+| `peer.pause()` | Hold outgoing app data in the queue (signaling keeps flowing; `send()` keeps accepting; queue TTL keeps running) |
+| `peer.resume()` | Release held app data immediately |
 | `peer.stream(tagId, options)` | Add/replace/remove a tagged media stream. `options: { video_track, audio_track }` |
 | `peer.addStream(stream, options?)` | Add a `MediaStream` (auto-extracts tracks) |
 | `peer.removeStream(stream)` | Remove a `MediaStream` |
@@ -373,7 +494,9 @@ var peer = new StableWebRTC(options);
 | `connectioninfo` | `info` | Connection type or candidate pair changed. Same format as `getConnectionInfo()` |
 | `networkprofile` | `profile` | Local network characterized. `{ public_ipv4, public_ipv6, all_public_ipv4, all_public_ipv6, local_ipv4, symmetric_nat, supports_udp, supports_tcp, needs_relay }` |
 | `streamstats` | `tagId, direction, stats` | Per-stream stats updated. `direction`: `'sending'` or `'receiving'`. `stats: { video: { active, width, height, fps, codec, bitrate, packetLoss, jitter }, audio: { active, codec, bitrate, packetLoss, jitter } }` |
-| `disconnect` | `{ reason, restartCount }` | ICE connection lost. `reason`: `'disconnected'` or `'failed'`. Automatic ICE restart begins. |
+| `drain` | — | The outgoing app-data queue emptied via sends — safe to resume writing (pairs with `peer.bufferedAmount`) |
+| `rtt` | `ms` | App-level DataChannel round-trip time measured by the ping/pong probe |
+| `disconnect` | `{ reason, restartCount }` | Connection lost. `reason`: `'disconnected'` / `'failed'` (from ICE) or `'timeout'` (liveness watchdog — no inbound traffic). Automatic ICE restart begins. |
 | `reconnect` | — | ICE connection recovered after a disconnect |
 | `fingerprints` | `localFP, remoteFP` | DTLS fingerprints available for identity verification |
 | `close` | — | Connection closed |
@@ -574,6 +697,9 @@ You don't choose. Roles are assigned automatically via nonce comparison at start
 
 **"What if both peers add video at the same time?"**
 Glare is resolved deterministically. One peer yields (rolls back), the other's offer goes through. The yielding peer re-sends its tracks in the next negotiation cycle. No deadlocks, no dropped tracks.
+
+**"What happens if the remote peer refreshes the page?"**
+A restarted peer generates a fresh session nonce, so its messages can never match the old session. The library detects the consistent mismatch streak, emits `error` ("remote peer appears to have restarted"), and closes. Listen for `close` and create a new `StableWebRTC` instance to reconnect — sessions are intentionally not resumable across restarts.
 
 **"What signaling transport should I use?"**
 Anything. WebSocket, HTTP long-polling, MQTT, Server-Sent Events, UDP, even SMS. The library handles reordering, deduplication, and compression. Signaling messages are binary Uint8Arrays — relay them as-is.
