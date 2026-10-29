@@ -53,6 +53,10 @@ export var SCHEMA_ACK = [['seq','uint16']];
   // sender can compute round-trip time against its own clock (no clock sync
   // needed). 'varint' comfortably holds a Date.now() value.
 export var SCHEMA_PING = [['timestamp','varint']];
+// PONG: the PING's timestamp back, and the answering side's own clock when it
+// answered — from which the asker estimates the offset between the two clocks
+// (to line up the two sides' traces).
+export var SCHEMA_PONG = [['timestamp','varint'],['peer_time','varint']];
 
   // SDP "min-viable" compact encoding for data-channel-only peers
 export var SCHEMA_SDP_MIN = [

@@ -10,12 +10,13 @@ import * as compactDelta from 'compact-delta';
 import {
   toU8, murmurhash3_str, murmurhash3_data, Emitter,
   isMediaStream, isMediaStreamTrack, isTrackEqual,
-  is_ipv6_addr, strip_brackets, is_public_ip
+  is_ipv6_addr, strip_brackets, is_public_ip, defer_task
 } from './util.js';
 import {
   compress_deflate, decompress_deflate, decompress_deflate_bytes
 } from './deflate.js';
 import { build_chunks, reassemble_chunk } from './chunking.js';
+import { createTrace, tracePeerConnection, errText } from './trace.js';
 import {
   is_support_trickle_ice, get_fingerprint_from_sdp, get_ufrag_from_sdp,
   parse_candidate, remove_all_ice_candidates
@@ -29,7 +30,7 @@ import {
   SCHEMA_SIGNAL_ENVELOPE, SCHEMA_SIGNAL_INNER, SCHEMA_DC_MSG,
   SCHEMA_SEQ_PAYLOAD, SCHEMA_SEQ_HASH_HASH_PAYLOAD, SCHEMA_NEG_DONE,
   SCHEMA_FAILED_DECOMPRESS, SCHEMA_TOTAL_ICE,
-  SCHEMA_SIGNAL_FRAME, SCHEMA_SIGNAL_CHUNK, SCHEMA_ACK, SCHEMA_PING
+  SCHEMA_SIGNAL_FRAME, SCHEMA_SIGNAL_CHUNK, SCHEMA_ACK, SCHEMA_PING, SCHEMA_PONG
 } from './schemas.js';
 
 export default StableWebRTC;
@@ -102,6 +103,15 @@ var _TD = new TextDecoder();
     }
 
     cert_wrtc_start_generate();
+  }
+
+  var MSGCODE_TYPE_NAME=null;   // code → name, for the trace (built on first use)
+  function msgcode_name(code){
+    if(MSGCODE_TYPE_NAME===null){
+      MSGCODE_TYPE_NAME={};
+      for(var k in MSGCODE_TYPE_MAP) MSGCODE_TYPE_NAME[MSGCODE_TYPE_MAP[k]]=k;
+    }
+    return MSGCODE_TYPE_NAME[code]!==undefined ? MSGCODE_TYPE_NAME[code] : code;
   }
 
   var MSGCODE_TYPE_MAP={
@@ -197,6 +207,132 @@ export function StableWebRTC(opts){
 
 
     var ev = Emitter();
+
+    // Connection trace (opts.trace — see trace.js). null when off: every
+    // trace point below is then a single `if(T)`.
+    var T = createTrace(opts.trace);
+    var T_data_in = 0, T_data_out = 0;
+    if(T){
+      T.rec('create', {
+        options: trace_options(opts),
+        // Node first: it has a navigator too (Node 21+), with little in it.
+        env: (typeof process!=='undefined' && process.versions && process.versions.node) ? { node: process.versions.node, platform: process.platform, arch: process.arch }
+           : (typeof navigator!=='undefined' && navigator.userAgent) ? { userAgent: navigator.userAgent, hardwareConcurrency: navigator.hardwareConcurrency, deviceMemory: navigator.deviceMemory }
+           : null
+      });
+      // What the engine tells the application goes into the trace as well —
+      // its 'log' lines (re-sends and the like), errors, disconnects, state.
+      var T_emit = ev.emit;
+      var T_last_state = null;
+      ev.emit = function(name){
+        try{ trace_emit(name, arguments); }catch(e){}
+        T_emit.apply(ev, arguments);
+        if(name==='close') T.close();   // after the listeners: they may still read it
+      };
+    }
+
+    // 'media' entries name the stream by its tag (the engine's tagged streams).
+    if(T) T.setMidToTag(function(mid, dir){
+      var list = dir==='send' ? connection.list_sending_live_mediastream : connection.list_receiving_live_mediastream;
+      for(var tag in list){
+        var r=list[tag];
+        if(r && (r.video_mid===mid || r.audio_mid===mid)) return tag;
+      }
+      return null;
+    });
+
+    function trace_emit(name, args){
+      var a1=args[1];
+      if(name==='data'){ T_data_in++; return; }          // counted, sent with the stats
+      if(name==='streamstats') return;                    // in getStats already
+      if(name==='signal'){ T.rec('signal.ext.out', { bytes: a1 && a1.byteLength }); return; }
+      if(name==='rtt'){ T.rec('rtt', args[2] || { sample: a1 }); return; }
+      if(name==='statechange'){
+        // Only what changed — and not the RTT/bandwidth numbers, which are in
+        // the stats and change every second.
+        var d={}, n=0;
+        for(var k in a1){
+          if(k==='rtt' || k==='ping_rtt' || k==='bandwidth_outgoing') continue;
+          if(!T_last_state || T_last_state[k]!==a1[k]){ d[k]=a1[k]; n++; }
+        }
+        T_last_state=a1;
+        if(n){ T.rec('state', d); T.mark(); }
+        return;
+      }
+      var out=[];
+      for(var i=1;i<args.length;i++) out.push(trace_value(args[i], 0));
+      T.rec('event.'+name, out.length===0 ? null : out.length===1 ? out[0] : out);
+      if(name==='error' || name==='disconnect' || name==='reconnect' || name==='close') T.mark();
+    }
+
+    // A value as JSON can carry it: errors as text, binary as its size,
+    // streams and tracks by id; objects a few levels deep.
+    function trace_value(v, depth){
+      if(v===null || v===undefined || typeof v==='number' || typeof v==='string' || typeof v==='boolean') return v===undefined ? null : v;
+      if(typeof v==='function') return '(function)';
+      if(v instanceof Error) return errText(v);
+      if(v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return { bytes: v.byteLength };
+      if(typeof v.getTracks==='function') return { stream: v.id };
+      if(typeof v.kind==='string' && typeof v.readyState==='string' && 'enabled' in v) return { track: v.id, kind: v.kind };
+      if(depth>=3) return '(…)';
+      if(Array.isArray(v)) return v.slice(0, 50).map(function(x){ return trace_value(x, depth+1); });
+      var o={};
+      for(var k in v){ if(typeof v[k]!=='function') o[k]=trace_value(v[k], depth+1); }
+      return o;
+    }
+
+    // Who is on the other side, once known: both nonces and both DTLS
+    // fingerprints, and `pair` — the same string in both sides' traces (the
+    // two sorted), to find the other half of a connection's trace. Recorded
+    // once both nonces and fingerprints are in (whichever comes last).
+    var T_peer_done=false;
+    function trace_peer(){
+      if(T_peer_done || !connection.remote_nonce || !connection.local_fingerprint || !connection.remote_fingerprint) return;
+      T_peer_done=true;
+      var nonces=[connection.local_nonce, connection.remote_nonce].sort(function(x,y){ return x-y; });
+      var lfp=fp_text(connection.local_fingerprint), rfp=fp_text(connection.remote_fingerprint);
+      var fps=[lfp, rfp].sort();
+      T.rec('peer', {
+        pair: (murmurhash3_str(fps.join('|')+'|'+nonces.join('-'))>>>0).toString(16) + '-' + nonces.join('-'),
+        local_nonce: connection.local_nonce,
+        remote_nonce: connection.remote_nonce,
+        local_fingerprint: lfp,
+        remote_fingerprint: rfp
+      });
+    }
+    // A fingerprint as the SDP writes it (AB:CD:...), whether held as bytes or text.
+    function fp_text(fp){
+      if(fp && typeof fp==='object' && typeof fp.length==='number'){
+        var h=[];
+        for(var i=0;i<fp.length;i++) h.push((fp[i]<16?'0':'')+fp[i].toString(16).toUpperCase());
+        return h.join(':');
+      }
+      return String(fp);
+    }
+
+    // getStats for the trace, with the engine's own queue state and message
+    // counts (totals since the start) beside it.
+    function trace_stats(stats){
+      var dc=connection.data_channel_primary_index!==null ? connection.list_data_channels[connection.data_channel_primary_index] : null;
+      T.stats(stats, {
+        signal_queue: signal_queue_length(),
+        data_queue: data_queue_length(),
+        buffered: dc ? dc.bufferedAmount : null,
+        data_in: T_data_in,
+        data_out: T_data_out,
+        negotiation_state: connection.negotiation_state
+      }, connection.pc);
+    }
+
+    function trace_options(o){
+      var out={};
+      for(var k in o){
+        if(k==='wrtc') { out[k]='(binding)'; continue; }
+        if(k==='trace') { out[k]=typeof o[k]==='function' ? '(function)' : o[k]; continue; }
+        out[k]=trace_value(o[k], 1);
+      }
+      return out;
+    }
     
     
 
@@ -235,6 +371,12 @@ export function StableWebRTC(opts){
       current_remote_candidate_type: null,
       current_rtt: null,
       current_ping_rtt: null,
+      // Smoothed DataChannel round-trip (from ping/pong) — see rtt_sample / rto.
+      srtt: null,
+      rttvar: null,
+      min_rtt: null,      // lowest ping_rtt on the current path (reset with srtt)
+      clock_offset: null,       // the peer's clock − ours (ms), from ping/pong
+      clock_offset_rtt: null,   // the round trip it was measured on (± half of it)
       current_bandwidth_outgoing: null,
       current_connection_type: 'unknown',
 
@@ -310,6 +452,7 @@ export function StableWebRTC(opts){
       last_remote_ufrag: null,
 
       need_ice_restart: false,
+      ice_lite_stun_dropped: false,   // see drop_stun_for_ice_lite()
       need_reoffer: false,
       ice_restart_timer: null,
       ice_restart_count: 0,
@@ -322,13 +465,30 @@ export function StableWebRTC(opts){
       ice_restart_reset_timer: null,
       ice_restart_stable_window_ms: 30000,
       gathering_timeout_ms: 8000,
+      opening_answer_wait_ms: 25000,   // option openingAnswerWait — see on_wait_for_answer_timeout
       gathering_max_retries: 3,
       gathering_timeout_timer: null,
       gathering_retry_count: 0,
       wait_for_answer_timeout_timer: null,
       negotiation_done_timeout_timer: null,
+
+      // --- Offer / answer reliability over the unreliable DC (see resend_*) ---
+      last_offer_signal: null,     // {seq, type, bytes} — the offer exactly as sent
+      last_answer_signal: null,    // {seq, type, bytes} — the answer exactly as sent
+      offer_resend_timer: null,
+      offer_resend_attempts: 0,
+      answer_resend_timer: null,
+      answer_resend_attempts: 0,
+      // Set when liveness finds the DC silent while ICE still says connected:
+      // signaling then goes external (send_signal) until inbound traffic returns.
+      signal_dc_suspect: false,
       
       making_rollback: false,
+      // Opening offer sent before it is applied (see create_offer): the SDP
+      // as sent, and the setLocalDescription in flight once we apply it.
+      offer_unapplied: false,
+      unapplied_offer_sdp: null,
+      unapplied_offer_waiters: null,
       polite_defer_started: null,
 
       pending_remote_offer_sdp: null,
@@ -483,6 +643,7 @@ export function StableWebRTC(opts){
     // a flood of bad frames cannot drown the app in events.
     function report_malformed_frame(source, error){
       connection.stats_dropped_malformed++;
+      if(T) T.rec('malformed', { source: source, error: errText(error) });
 
       var now=Date.now();
       if(now-connection.last_malformed_emit_ts>=1000){
@@ -513,10 +674,10 @@ export function StableWebRTC(opts){
             bucket.drained++;
 
             connection.pc.addIceCandidate(candidate).then(function(){
-              setTimeout(drain_pending_remote_candidates,0);
+              defer_task(drain_pending_remote_candidates);   // a task, not a timer (util.js)
             }).catch(function(error){
               ev.emit('error', error);
-              setTimeout(drain_pending_remote_candidates,0);
+              defer_task(drain_pending_remote_candidates);   // a task, not a timer (util.js)
             });
 
             return; // one at a time; the .then() re-invokes us
@@ -535,6 +696,29 @@ export function StableWebRTC(opts){
     // O(n log n) priority sort, and memory against a hostile flood.
     var MAX_REMOTE_UFRAG_BUCKETS = 8;
     var MAX_REMOTE_CANDIDATES_PER_UFRAG = 256;
+
+    // Sort key of a remote candidate, parsed once per candidate object.
+    // The pending list is re-sorted on every arrival, and until the remote
+    // description is set nothing drains it — so the comparator used to run
+    // parse_candidate twice per comparison, O(n log n) parses per arrival and
+    // O(n² log n) for a burst. The key holds exactly what the comparator read
+    // from the parse; WeakMap, so it goes when the candidate does.
+    var remote_candidate_sort_keys = new WeakMap();
+
+    function remote_candidate_sort_key(candidate){
+      var cacheable = candidate!==null && (typeof candidate==='object' || typeof candidate==='function');
+      var key = cacheable ? remote_candidate_sort_keys.get(candidate) : undefined;
+      if(key===undefined){
+        var obj = parse_candidate(candidate.candidate);
+        key = {
+          priority: obj.priority + (obj.transport === 'tcp' ? 1 : 0),
+          has_foundation: ('foundation' in obj) && obj.foundation!==null,
+          foundation: obj.foundation
+        };
+        if(cacheable) remote_candidate_sort_keys.set(candidate, key);
+      }
+      return key;
+    }
 
     function add_remote_candidates(candidate){
       if(connection.remote_support_trickle_ice==null){
@@ -576,13 +760,13 @@ export function StableWebRTC(opts){
 
         if(connection.list_remote_candidates[of_ufrag].pending.length>=2){
           connection.list_remote_candidates[of_ufrag].pending.sort(function(a, b){
-            var obj_a = parse_candidate(a.candidate);
-            var obj_b = parse_candidate(b.candidate);
+            var key_a = remote_candidate_sort_key(a);
+            var key_b = remote_candidate_sort_key(b);
 
-            var aPriority = obj_a.priority + (obj_a.transport === 'tcp' ? 1 : 0);
-            var bPriority = obj_b.priority + (obj_b.transport === 'tcp' ? 1 : 0);
-            if (aPriority === bPriority && 'foundation' in obj_a && 'foundation' in obj_b && obj_a.foundation!==null && obj_b.foundation!==null) {
-            return obj_a.foundation.localeCompare(obj_b.foundation);
+            var aPriority = key_a.priority;
+            var bPriority = key_b.priority;
+            if (aPriority === bPriority && key_a.has_foundation && key_b.has_foundation) {
+            return key_a.foundation.localeCompare(key_b.foundation);
             } else {
             return bPriority - aPriority;
             }
@@ -656,7 +840,7 @@ export function StableWebRTC(opts){
               if(ddc && ddc.readyState!=='closed' && ddc.readyState!=='closing'){ any_still_alive=true; break; }
             }
             if(!any_still_alive){
-              connection.create_data_channel_timer=setTimeout(function(){
+              connection.create_data_channel_timer=arm(function(){
                 connection.create_data_channel_timer=null;
                 if(pc_alive() && connection.data_channel_primary_index==null){
                   ev.emit('log','all data channels died while the connection is alive — recreating');
@@ -799,8 +983,11 @@ export function StableWebRTC(opts){
     // [engine-diag] The offer pipeline had FOUR silent dead-ends (handler
     // drop, failure lockout, neg-state guard, needed-veto) — three were
     // real bugs found blind. Every branch now narrates under WEBRTC_DEBUG.
-    var _engine_diag = (typeof process!=='undefined' && process.env && process.env.WEBRTC_DEBUG)
+    var _engine_diag_env = (typeof process!=='undefined' && process.env && process.env.WEBRTC_DEBUG)
       ? function(m){ console.log('[engine-diag] '+m); } : function(){};
+    // Also into the trace: these are the engine's own decisions (offer timer
+    // skipped, latched, ...).
+    var _engine_diag = T ? function(m){ _engine_diag_env(m); T.rec('diag', m); } : _engine_diag_env;
 
     /* ══════════ Deterministic politeness (perfect negotiation) ══════════
      *
@@ -827,6 +1014,7 @@ export function StableWebRTC(opts){
      * (max_wait_time) remains the recovery valve for all edge cases.
      */
     var POLITE_DEFER_MAX_MS = 2500;
+    var GLARE_YIELD_MS = 6000;   // see handle_duplicate_offer
 
     function politeness(){
       if(connection.negotiation_role==='lead'){ return false; }    // configured impolite
@@ -834,6 +1022,28 @@ export function StableWebRTC(opts){
       if(!connection.remote_nonce){ return null; }                 // unknown yet
       if(connection.local_nonce === connection.remote_nonce){ return null; }
       return connection.local_nonce < connection.remote_nonce;     // true = polite
+    }
+
+    // The role in force NOW: the base role, flipped on odd epochs — the same
+    // rule process_income_offer uses to accept or drop an incoming offer.
+    // RULE-B must use THIS. With the unflipped politeness() there, every odd
+    // epoch made BOTH sides drop each other's offer (one in
+    // process_income_offer, the other in RULE-B): a glare loop that never
+    // resolves, so media added after the first renegotiation never flowed.
+    // The role is FIXED for the life of this instance: politeness() only.
+    //
+    // It used to flip on every odd epoch_negotiation_success. That counter is
+    // kept by each side on its own — the offerer counts an answer it applied,
+    // the answerer learns it from NEGOTIATION_DONE — so one lost or late DONE
+    // (signals arriving in a burst, out of order: a relay link coming up, a
+    // retransmit after loss) left the two counters one apart. The flip then
+    // happened on ONE side only: both sides impolite, each dropping the
+    // other's offer for good, renegotiation never completing — connected but
+    // no video (Chrome simulation: 50–87% of calls when signals arrive in a
+    // burst). With a role both sides compute from the same two nonces, they
+    // can never disagree.
+    function politeness_now(){
+      return politeness();
     }
 
     function opening_phase(){
@@ -844,7 +1054,7 @@ export function StableWebRTC(opts){
     }
 
     function create_offer_schedule(){
-      clearTimeout(connection.create_offer_timer);
+      disarm(connection.create_offer_timer);
       connection.create_offer_timer=null;
 
       // Exponential backoff on consecutive failures, max 10 retries
@@ -852,26 +1062,43 @@ export function StableWebRTC(opts){
         _engine_diag('offer_schedule: LOCKED OUT (failures='+connection.create_offer_failures+')');
         return;
       }
+      // Mid-session: a short random delay — it coalesces a burst of changes
+      // (audio + video added one after the other) into one offer, and
+      // staggers the two sides, since a mid-session collision still costs
+      // the polite side a rollback (RULE B). The opening needs neither: a
+      // collision there is resolved without rollback or wait (the opening
+      // offer goes out unapplied — create_offer), and the transceivers are
+      // created right before createOffer anyway; a timer turn still batches
+      // whatever the application does in the same tick. Failures back off
+      // either way.
       var base_delay = 5 + Math.floor(Math.random() * 15);
       var delay = Math.min(base_delay * Math.pow(2, connection.create_offer_failures), 5000);
+      if(opening_phase() && connection.create_offer_failures===0) delay = 0;
       _engine_diag('offer_schedule: armed, delay='+delay+'ms failures='+connection.create_offer_failures);
 
-      connection.create_offer_timer=setTimeout(function offer_timer_body(){
+      connection.create_offer_timer=arm(function offer_timer_body(){
         connection.create_offer_timer=null;
 
         // RULE A — polite opening deferral. Conditions, not history: each
         // pass re-evaluates; the moment the impolite side's offer commits
         // (opening_phase turns false) or the deadline passes, we proceed.
+        //
+        // Only a side that KNOWS it is polite waits. Unknown politeness —
+        // the normal case at the very start, when no frame has arrived yet
+        // to carry the peer's nonce — used to wait too: both sides sat out
+        // the full deadline on every connection, then offered at the same
+        // moment anyway. Now it offers at once, without applying the offer
+        // (create_offer): the offer carries our nonce, and whichever offer
+        // the impolite side sent is the one both end up applying.
         if(opening_phase()){
           var _pol = politeness();
-          if(_pol===true || _pol===null){
+          if(_pol===true){
             if(connection.polite_defer_started==null){
               connection.polite_defer_started=Date.now();
-              _engine_diag('RULE-A: '+(_pol===true?'polite':'politeness-unknown')+
-                           ' — deferring opening offer (deadline '+POLITE_DEFER_MAX_MS+'ms)');
+              _engine_diag('RULE-A: polite — deferring opening offer (deadline '+POLITE_DEFER_MAX_MS+'ms)');
             }
             if(Date.now()-connection.polite_defer_started < POLITE_DEFER_MAX_MS){
-              connection.create_offer_timer=setTimeout(offer_timer_body, 120);
+              connection.create_offer_timer=arm(offer_timer_body, 120);
               return;
             }
             _engine_diag('RULE-A: defer deadline passed — offering anyway (liveness)');
@@ -888,6 +1115,23 @@ export function StableWebRTC(opts){
           _engine_diag('offer_timer fired: SKIPPED (pc='+(!!connection.pc)+' neg='+connection.negotiation_state+')');
         }
       }, delay);
+    }
+
+    // A deferral that may be "now" (0ms) or a real wait. A 0ms setTimeout is
+    // NOT "now" in a hidden tab: Chrome runs timers there at most once a
+    // second, so the opening offer and the first data channel — both armed
+    // with 0ms — each waited up to a second before anything was sent. 0ms
+    // goes through defer_task (a task, not a timer — util.js), a real wait
+    // stays a timer. The handle is an object either way: disarm() cancels
+    // both kinds; `handle != null` still means "armed".
+    function arm(fn, ms){
+      if(!(ms>0)) return { cancel: defer_task(fn) };
+      var h=setTimeout(fn, ms);
+      return { cancel: function(){ clearTimeout(h); } };
+    }
+    function disarm(handle){
+      if(handle && typeof handle.cancel==='function') handle.cancel();
+      else if(handle!=null) clearTimeout(handle);
     }
 
     function set_connection_state(options){
@@ -960,6 +1204,26 @@ export function StableWebRTC(opts){
           if(connection.negotiation_state!==2){
             clearTimeout(connection.wait_for_answer_timeout_timer);
             connection.wait_for_answer_timeout_timer=null;
+            stop_offer_resend();     // only an offer still waiting (state 2) is re-sent
+            // An opening offer that went out unapplied is done with once its
+            // round is (answered → applied by then; dropped; timed out).
+            connection.offer_unapplied=false;
+            connection.unapplied_offer_sdp=null;
+          }
+
+          // A remote offer that arrived while ours was being created (state 1)
+          // was kept pending — and only looked at again back at state 0. With
+          // ours out (state 2) nobody did: the polite side sat on the peer's
+          // offer waiting for an answer the impolite side never sends (it
+          // ignores ours by design) — stuck until the answer timeout, and
+          // the two timeouts' rollbacks could then cross and leave the
+          // connection half-negotiated. set_remote_offer handles state 2
+          // (polite: drop / roll back ours, answer theirs).
+          if(connection.negotiation_state===2 && connection.pending_remote_offer_sdp!==null && connection.pc){
+            set_remote_offer();
+          }
+          if(connection.negotiation_state!==5){
+            stop_answer_resend();    // only an answer still waiting for DONE (state 5)
           }
 
           if(connection.negotiation_state==0){
@@ -993,6 +1257,8 @@ export function StableWebRTC(opts){
             clearTimeout(connection.negotiation_done_timeout_timer);
             connection.negotiation_done_timeout_timer=null;
 
+            // At least 3s — longer on a slow line, so the answer re-sends (and
+            // the DONE they draw out) get their turns before we stop waiting.
             connection.negotiation_done_timeout_timer=setTimeout(function(){
               connection.negotiation_done_timeout_timer=null;
               if(connection.negotiation_state==5){
@@ -1001,7 +1267,7 @@ export function StableWebRTC(opts){
                   negotiation_state: 0
                 });
               }
-            },3000);
+            },Math.max(3000, 6*rto(300,2000,1000)));
             
           }else{
             if(connection.negotiation_done_timeout_timer!==null){
@@ -1034,6 +1300,7 @@ export function StableWebRTC(opts){
             }
 
             if(emit_fingerprints_available){
+              if(T) trace_peer();
               ev.emit('fingerprints',connection.local_fingerprint,connection.remote_fingerprint);
             }
 
@@ -1096,6 +1363,7 @@ export function StableWebRTC(opts){
         dc.onmessage=function(event){
           var now = Date.now();
           connection.last_recv_time = now;   // any inbound traffic proves the peer is alive
+          connection.signal_dc_suspect = false;   // ...and that the DC delivers again
           var bytes=event.data.byteLength||event.data.length||0;
           var rvs=connection.data_channel_recv_events;
           rvs.push([now,bytes]);
@@ -1144,6 +1412,10 @@ export function StableWebRTC(opts){
         };
 
         dc.onbufferedamountlow=function(){
+          // The pump may be parked on its 10 ms wait for room in the buffer —
+          // up to a second in a hidden tab, where timers run once a second.
+          // The room is here now: go at once (as data_channel_send_signal does).
+          cancel_pump_timer();
           data_channel_schedule_pump();
         };
 
@@ -1224,6 +1496,7 @@ export function StableWebRTC(opts){
           connection.pc.getStats().then(function(stats) {
             try{
               connection.getstats_running=false;
+              if(T) trace_stats(stats);
   
               var obj_reports={};
   
@@ -1350,6 +1623,18 @@ export function StableWebRTC(opts){
                           current_bandwidth_outgoing: bandwidth_outgoing,
                           current_connection_type: conn_type
                         });
+
+                        // A different selected path (other addresses — e.g. after an ICE
+                        // restart, or relay → direct) has its own round-trip: the old
+                        // estimate would take ~8 samples (~16s) to drift over. Start
+                        // the smoothed RTT afresh from the next ping.
+                        var rtt_path_key=local_ip+':'+local_port+'>'+remote_ip+':'+remote_port;
+                        if(connection._rtt_path_key!=null && connection._rtt_path_key!==rtt_path_key){
+                          connection.srtt=null;
+                          connection.rttvar=null;
+                          connection.min_rtt=null;
+                        }
+                        connection._rtt_path_key=rtt_path_key;
 
                         // Emit connectioninfo when connection type or candidate pair changes
                         if(prev_conn_type!==conn_type || prev_conn_type==='unknown'){
@@ -1697,6 +1982,11 @@ export function StableWebRTC(opts){
             // window; if it works, inbound traffic resumes and refreshes it.
             connection.ice_restart_count++;
             connection.last_recv_time=Date.now();
+            // The DC just proved it delivers nothing — yet ICE says connected,
+            // so send_signal would put the restart offer (and its candidates)
+            // on that same silent DC. Route signaling external until real
+            // inbound traffic clears this (dc.onmessage).
+            connection.signal_dc_suspect=true;
             restartIce();
           }else{
             // Exhausted — give up and close cleanly (emits 'close', frees the PC).
@@ -1721,7 +2011,10 @@ export function StableWebRTC(opts){
       return {
         type: connection.current_connection_type||'unknown',
         rtt: connection.current_rtt,             // ICE/DTLS-level (from getStats; may be null on some bindings)
-        ping_rtt: connection.current_ping_rtt,   // app-level DataChannel round-trip (from ping/pong)
+        ping_rtt: connection.current_ping_rtt,   // app-level DataChannel round-trip (from ping/pong) — last raw sample
+        srtt: connection.srtt!=null ? Math.round(connection.srtt) : null,      // smoothed ping_rtt (rtt_sample) — the stable one
+        min_rtt: connection.min_rtt,             // lowest ping_rtt on the current path — the line without queues
+        rttvar: connection.rttvar!=null ? Math.round(connection.rttvar) : null,
         bandwidth_outgoing: connection.current_bandwidth_outgoing,
         local: {
           ip: connection.current_local_ip,
@@ -1819,14 +2112,23 @@ export function StableWebRTC(opts){
 
           connection.sctp=connection.pc.sctp;
 
+          // The transports are read from these, captured once — not again
+          // through connection.pc.sctp inside each handler: pc.sctp is a
+          // getter (in webrtc-server it is computed on every read), and a
+          // handler that read null there threw inside the library's own
+          // packet handling.
+          var sctp=connection.sctp;
+          var sctp_dtls=sctp.transport || null;
+          var sctp_ice=(sctp_dtls && sctp_dtls.iceTransport) || null;
+
           adopt_primary_data_channel();
 
           try{
               
-            if(connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport){
+            if(sctp_ice){
 
               set_connection_state({
-                sctp_ice_state: String(connection.pc.sctp.transport.iceTransport.state)+""
+                sctp_ice_state: String(sctp_ice.state)+""
               });
 
             }
@@ -1835,10 +2137,10 @@ export function StableWebRTC(opts){
           }
 
           try{
-            if(connection.pc.sctp.transport){
+            if(sctp_dtls){
 
               set_connection_state({
-                sctp_dtls_state: String(connection.pc.sctp.transport.state)+""
+                sctp_dtls_state: String(sctp_dtls.state)+""
               });
 
             }
@@ -1849,7 +2151,7 @@ export function StableWebRTC(opts){
           try{
 
             set_connection_state({
-              sctp_state: String(connection.pc.sctp.state)+""
+              sctp_state: String(sctp.state)+""
             });
 
           } catch (error) {
@@ -1857,13 +2159,13 @@ export function StableWebRTC(opts){
           }
 
           try{
-            if(connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport && 'onstatechange' in connection.pc.sctp.transport.iceTransport){
-              connection.pc.sctp.transport.iceTransport.onstatechange=function(){
+            if(sctp_ice && 'onstatechange' in sctp_ice){
+              sctp_ice.onstatechange=function(){
                 if(pc_alive()){
 
 
                   set_connection_state({
-                    sctp_ice_state: String(connection.pc.sctp.transport.iceTransport.state)+""
+                    sctp_ice_state: String(sctp_ice.state)+""
                   });
 
                   adopt_primary_data_channel();
@@ -1876,13 +2178,13 @@ export function StableWebRTC(opts){
           }
 
           try{
-            if(connection.pc.sctp.transport && 'onstatechange' in connection.pc.sctp.transport){
-              connection.pc.sctp.transport.onstatechange=function(){
+            if(sctp_dtls && 'onstatechange' in sctp_dtls){
+              sctp_dtls.onstatechange=function(){
                   
                 if(pc_alive()){
                   
                   set_connection_state({
-                    sctp_dtls_state: String(connection.pc.sctp.transport.state)+""
+                    sctp_dtls_state: String(sctp_dtls.state)+""
                   });
                   
                   adopt_primary_data_channel();
@@ -1896,12 +2198,12 @@ export function StableWebRTC(opts){
           }
 
           try{
-            if('onstatechange' in connection.pc.sctp){
-              connection.pc.sctp.onstatechange=function(){
+            if('onstatechange' in sctp){
+              sctp.onstatechange=function(){
                 if(pc_alive()){
 
                   set_connection_state({
-                    sctp_state: String(connection.pc.sctp.state)+""
+                    sctp_state: String(sctp.state)+""
                   });
 
                   adopt_primary_data_channel();
@@ -1913,11 +2215,12 @@ export function StableWebRTC(opts){
           }
           
           try{
-            if(connection.pc.sctp.transport && connection.pc.sctp.transport.iceTransport && 'onselectedcandidatepairchange' in connection.pc.sctp.transport.iceTransport){
-              connection.pc.sctp.transport.iceTransport.onselectedcandidatepairchange=function(){
+            if(sctp_ice && 'onselectedcandidatepairchange' in sctp_ice){
+              sctp_ice.onselectedcandidatepairchange=function(){
                 if(pc_alive()){
-                  var selected_candidate_pair=connection.pc.sctp.transport.iceTransport.getSelectedCandidatePair();
-
+                  var selected_candidate_pair=sctp_ice.getSelectedCandidatePair();
+                  // null when no pair is selected (yet, or any more)
+                  if(selected_candidate_pair && selected_candidate_pair.local && selected_candidate_pair.remote)
                   set_connection_state({
                     local_protocol: selected_candidate_pair.local.protocol,
                     remote_protocol: selected_candidate_pair.remote.protocol
@@ -1946,9 +2249,60 @@ export function StableWebRTC(opts){
       send_signal(MSGCODE_TYPE_MAP['NEGOTIATION_DONE'],uint8buffer);
     }
 
+    // Apply the opening offer that went out unapplied (create_offer). One
+    // setLocalDescription however many callers ask meanwhile; cb(true) once
+    // applied, cb(false) if it failed — the offer round is then abandoned
+    // (state 0) and the renegotiation machinery offers again.
+    function apply_unapplied_offer(cb){
+      if(!connection.offer_unapplied){ if(cb) cb(true); return; }
+      if(connection.unapplied_offer_waiters){ if(cb) connection.unapplied_offer_waiters.push(cb); return; }
+      connection.unapplied_offer_waiters = cb ? [cb] : [];
+      var sdp=connection.unapplied_offer_sdp;
+      function done(ok){
+        var w=connection.unapplied_offer_waiters || [];
+        connection.unapplied_offer_waiters=null;
+        for(var i=0;i<w.length;i++){ try{ w[i](ok); }catch(e){} }
+      }
+      _engine_diag('applying the opening offer (sent unapplied)');
+      connection.pc.setLocalDescription(new RTCSessionDescription({ type: 'offer', sdp: sdp })).then(function(){
+        // Still ours to apply? A polite turn (set_remote_offer) or a timeout
+        // may have dropped it meanwhile — then this description is theirs to
+        // undo, and they do (rollback_signaling_to_stable).
+        var still=connection.offer_unapplied && connection.unapplied_offer_sdp===sdp;
+        connection.offer_unapplied=false;
+        connection.unapplied_offer_sdp=null;
+        if(!pc_alive()){ done(false); return; }
+        // Dropped while applying, and nobody is going to undo it (the round
+        // was abandoned — back at 0): undo it here.
+        if(!still && connection.negotiation_state===0 && connection.pc.signalingState==='have-local-offer'){
+          rollback_signaling_to_stable(null);
+        }
+        done(still);
+      }).catch(function(error){
+        connection.offer_unapplied=false;
+        connection.unapplied_offer_sdp=null;
+        done(false);
+        if(connection.negotiation_state==2){
+          connection.create_offer_failures++;
+          connection.base_offer_sdp=null;
+          set_connection_state({ negotiation_state: 0 });
+        }
+        ev.emit('error', error);
+      });
+    }
+
     function process_income_answer(sdp,seq_offer) {
       //console.log('process_income_answer:');
       //console.log(sdp);
+
+      // The answer to an opening offer that went out unapplied: apply the
+      // offer first, then take the answer as usual.
+      if(connection.offer_unapplied && connection.negotiation_state==2 && seq_offer==connection.local_offer_history.length){
+        apply_unapplied_offer(function(ok){
+          if(ok) process_income_answer(sdp,seq_offer);
+        });
+        return;
+      }
 
       if(connection.remote_support_trickle_ice==null){
         connection.remote_support_trickle_ice=is_support_trickle_ice(sdp);
@@ -1970,6 +2324,10 @@ export function StableWebRTC(opts){
             if(!pc_alive()) return;
 
             drain_pending_remote_candidates();
+
+            // Our offer was gathered with the full list — restarts ICE if the
+            // answer is from an ICE Lite peer.
+            drop_stun_for_ice_lite(sdp, true);
 
             if(connection.negotiation_state==3 && seq_offer==connection.local_offer_history.length){
 
@@ -2038,6 +2396,45 @@ export function StableWebRTC(opts){
 
     var pending_rollback_callbacks=[];
 
+    // Close our never-opened data channels when the offer they were created
+    // for is abandoned for the peer's: its channel (in the offer we take)
+    // is adopted via ondatachannel instead. Two reasons, one window:
+    //   - rollback (Chrome SCTP wedge): rolling back a local offer whose
+    //     createDataChannel() started the SCTP transport, then answering a
+    //     remote offer that also carries m=application, wedges Chrome —
+    //     setLocalDescription(answer) rejects "Failed to start SCTP
+    //     transport" and every later answer on this pc fails the same way;
+    //   - answering the opening offer (set_remote_offer): our channel — from
+    //     an offer of ours dropped unapplied, or the startup poller — would
+    //     open alongside the peer's: two channels at startup, and messages
+    //     sent right after 'connect' on the one that loses the lowest-id
+    //     adoption (adopt_primary_data_channel) are lost in the switch.
+    // Guards keep this strictly to the startup window: the connection never
+    // had ANY open channel, SCTP never connected, and only channels still in
+    // 'connecting' are touched. If the remote offer carries no
+    // m=application, the fresh-connection poller recreates our channel once
+    // negotiation settles back to 0 (its list-empty condition holds again).
+    function close_unopened_data_channels(why){
+      if(connection.data_channel_connect_time!=null) return;
+      if(connection.pc && connection.pc.sctp!=null && connection.pc.sctp.state==='connected') return;
+      var _had=connection.list_data_channels.length;
+      var _closed=0;
+      for(var _di=connection.list_data_channels.length-1; _di>=0; _di--){
+        var _dc=connection.list_data_channels[_di];
+        if(_dc && _dc.readyState==='connecting'){
+          try{ _dc.close(); }catch(_e){}
+          connection.list_data_channels.splice(_di,1);
+          _closed++;
+        }
+      }
+      if(_closed>0){
+        if(connection.list_data_channels.length===0){
+          connection.data_channel_primary_index=null;
+        }
+        ev.emit('log',why+': closed '+_closed+'/'+_had+' never-opened data channel(s)');
+      }
+    }
+
     function rollback_signaling_to_stable(callback){
       if(connection.pc){
         if(connection.pc.signalingState == 'stable'){
@@ -2069,26 +2466,7 @@ export function StableWebRTC(opts){
             // fresh-connection poller recreates our channel once
             // negotiation settles back to 0 (its list-empty condition
             // holds again) — self-healing, no starvation regression.
-            if(connection.data_channel_connect_time==null &&
-               (connection.pc.sctp==null || connection.pc.sctp.state!=='connected')){
-              var _had=connection.list_data_channels.length;
-              var _closed=0;
-              for(var _di=connection.list_data_channels.length-1; _di>=0; _di--){
-                var _dc=connection.list_data_channels[_di];
-                if(_dc && _dc.readyState==='connecting'){
-                  try{ _dc.close(); }catch(_e){}
-                  connection.list_data_channels.splice(_di,1);
-                  _closed++;
-                }
-              }
-              if(_closed>0){
-                if(connection.list_data_channels.length===0){
-                  connection.data_channel_primary_index=null;
-                }
-                ev.emit('log','app-glare rollback: closed '+_closed+'/'+_had+
-                  ' never-opened data channel(s) before rollback (Chrome SCTP-wedge workaround)');
-              }
-            }
+            close_unopened_data_channels('app-glare rollback');
 
             connection.pc.setLocalDescription({ type: 'rollback' }).then(function () {
               connection.making_rollback=false;
@@ -2149,13 +2527,30 @@ export function StableWebRTC(opts){
         // politeness the legacy rollback path below stays authoritative.
         // If anything goes sideways, the pending-offer max_wait_time
         // rollback remains the recovery valve.
-        if(connection.negotiation_state===2 && !opening_phase() && politeness()===false){
+        // if(connection.negotiation_state===2 && !opening_phase() && politeness()===false){
+        if(connection.negotiation_state===2 && !opening_phase() && politeness_now()===false && !connection.force_yield){
           _engine_diag('RULE-B: impolite — ignoring incoming offer while ours is in flight (peer will rollback & answer)');
           connection.pending_remote_offer_sdp=null;
           return;
         }
 
+        connection.force_yield=false;
         var pre_state=connection.negotiation_state;
+        // Polite turn on an opening offer of ours that went out unapplied:
+        // drop it — nothing was applied, so nothing to roll back.
+        if(connection.offer_unapplied){
+          _engine_diag('dropping our unapplied opening offer — answering theirs');
+          connection.offer_unapplied=false;
+          connection.unapplied_offer_sdp=null;
+        }
+        // Answering the OPENING offer, and it brings the peer's data channel
+        // (m=application): ours, not yet open — from an offer of ours just
+        // dropped, or the fresh-connection poller (try_create_dc) a moment
+        // before the peer's offer landed — would only open alongside it.
+        // One channel from the start; see close_unopened_data_channels.
+        if(opening_phase() && /^m=application/m.test(String(connection.pending_remote_offer_sdp))){
+          close_unopened_data_channels('answering the opening offer');
+        }
         set_connection_state({
           negotiation_state: 4
         });
@@ -2259,6 +2654,8 @@ export function StableWebRTC(opts){
 
         function applyRemoteOffer(){
           if(!pc_alive()) return;
+          // Before the answer gathers: an ICE Lite offerer needs no STUN.
+          drop_stun_for_ice_lite(connection.pending_remote_offer_sdp, false);
           connection.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: connection.pending_remote_offer_sdp })).then(function(){
             if(!pc_alive()) return;
 
@@ -2313,7 +2710,14 @@ export function StableWebRTC(opts){
         connection.pending_remote_offer_sdp=null;
 
         var base_remote_polite;
-        if(connection.remote_nonce!==connection.local_nonce){
+        // A configured role wins over the nonce draw — same order as
+        // politeness(), so RULE-B and this function can never disagree.
+        if(connection.negotiation_role==='lead'){
+          base_remote_polite = false;
+        }else if(connection.negotiation_role==='follow'){
+          base_remote_polite = true;
+        }else if(connection.remote_nonce!==connection.local_nonce){
+        // if(connection.remote_nonce!==connection.local_nonce){
           base_remote_polite = (connection.remote_nonce > connection.local_nonce);
         }else{
           // 1-in-65534 tie: both peers drew the same nonce, so nonce comparison
@@ -2338,16 +2742,33 @@ export function StableWebRTC(opts){
           }
         }
 
-        var even_epoch = (connection.epoch_negotiation_success % 2) === 0;
-        var polite_now = even_epoch ? base_remote_polite : !base_remote_polite;
+        // Fixed role — see politeness_now(). (No flip on the epoch.)
+        var polite_now = base_remote_polite;
 
-        if(connection.negotiation_state==0 || polite_now==true){
+        // Glare is only when an offer of OURS is in flight (being created,
+        // waiting for its answer, or being applied). Impolite in any other
+        // state — answering their previous offer (4), waiting for its DONE
+        // (5) — there is nothing of ours to win with: their new offer used to
+        // be dropped all the same, and since its seq was already recorded,
+        // every re-send of it was then ignored as a duplicate. Kept pending
+        // now, and taken up when the current round ends (state 0).
+        var own_offer_in_flight = (connection.negotiation_state==1 || connection.negotiation_state==2 || connection.negotiation_state==3);
+        if(connection.negotiation_state==0 || polite_now==true || !own_offer_in_flight){
+          connection.glare_ignored=null;
           connection.pending_remote_offer_sdp=sdp;
           if(connection.pc && (connection.negotiation_state==0 || connection.negotiation_state==2 || connection.negotiation_state==5)){
             set_remote_offer();
           }
         }else{
+          // Remembered, in case the peer never yields (see handle_duplicate_offer).
+          connection.glare_ignored={ seq: seq_offer, sdp: sdp, at: Date.now(), dups: 0 };
           //console.log('ignored_offer_due_to_glare');
+          // We are the impolite side of an opening collision: ours is the
+          // offer both will apply — apply it now, so ICE gathering starts
+          // instead of waiting for the answer.
+          if(connection.offer_unapplied && connection.negotiation_state==2){
+            apply_unapplied_offer(null);
+          }
         }
 
       }else{
@@ -2366,9 +2787,75 @@ export function StableWebRTC(opts){
       }
     }
 
+    // ── STUN toward an ICE Lite peer ──
+    //
+    // An ICE Lite peer (a=ice-lite — a server: an SFU, a gateway) sits on a
+    // public address and learns ours from our own connectivity checks
+    // (peer-reflexive), so STUN buys nothing toward it. Worse, it can make the
+    // direct path impossible: such a server often answers STUN on the very
+    // address its ICE candidate uses (one UDP port, demultiplexed), and
+    // Chrome hands every packet from a configured STUN server's address to its
+    // STUN handling — the server's check responses, DTLS and data from that
+    // address are swallowed there and never reach ICE. The direct pair then
+    // never succeeds and the connection runs through TURN.
+    //
+    // So once the remote side turns out to be ICE Lite, the STUN urls are
+    // dropped from this PC's configuration; TURN stays, the fallback for
+    // networks that block UDP. Once per instance — pc_config keeps the
+    // filtered list, so a rebuilt pc starts without them too.
+    //
+    // Gathering already done with STUN (we sent the offer, or an earlier
+    // negotiation ran) is redone by an ICE restart; when we are about to
+    // answer for the first time, setConfiguration alone is enough — Chrome
+    // discards the pre-gathered pool when the servers change, and gathers for
+    // the answer with the new list.
+    function drop_stun_for_ice_lite(sdp, we_offered){
+      if(connection.ice_lite_stun_dropped) return;
+      if(typeof sdp!='string' || !/^a=ice-lite\s*$/m.test(sdp)) return;
+      connection.ice_lite_stun_dropped=true;
+
+      var servers=connection.pc_config.iceServers || [];
+      var kept=[], removed=0;
+      for(var i=0;i<servers.length;i++){
+        var srv=servers[i];
+        if(!srv) continue;
+        var urls=Array.isArray(srv.urls) ? srv.urls : [srv.urls];
+        var rest=urls.filter(function(u){ return !/^stuns?:/i.test(String(u)); });
+        removed+=urls.length-rest.length;
+        if(rest.length>0){
+          var copy={};
+          for(var k in srv){ if(Object.prototype.hasOwnProperty.call(srv,k)) copy[k]=srv[k]; }
+          copy.urls=rest;
+          kept.push(copy);
+        }
+      }
+      if(removed==0) return;
+
+      // Straight to the pc, not through setConfiguration(): that one puts
+      // public STUN servers back when the list is empty.
+      connection.pc_config.iceServers=kept;
+      try {
+        if(connection.pc) connection.pc.setConfiguration(connection.pc_config);
+      } catch(e){
+        ev.emit('log','ice-lite: setConfiguration failed ('+((e && e.message) || e)+') — STUN kept');
+        return;
+      }
+      ev.emit('log','ice-lite peer: dropped '+removed+' STUN url(s)'+
+                    (we_offered || (connection.pc && connection.pc.iceGatheringState!=='new') ? ', restarting ICE' : ''));
+
+      if(we_offered || (connection.pc && connection.pc.iceGatheringState!=='new')){
+        restartIce();
+      }
+    }
+
     function send_answer_raw(seq,raw_answer_sdp){
       var uint8buffer=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(raw_answer_sdp)});
-      send_signal(MSGCODE_TYPE_MAP['ANSWER_RAW'],uint8buffer);
+      var raw_slot={ seq:seq, type:MSGCODE_TYPE_MAP['ANSWER_RAW'], bytes:uint8buffer };
+      // Same as send_offer_raw: re-sends from here on use the RAW form.
+      if(connection.last_answer_signal && connection.last_answer_signal.seq===seq){
+        connection.last_answer_signal=raw_slot;
+      }
+      send_signal(raw_slot.type,raw_slot.bytes,raw_slot);
     }
 
     function send_answer(seq,base_sdp,raw_answer_sdp){
@@ -2416,22 +2903,31 @@ export function StableWebRTC(opts){
         ev.emit('log','answer payload: '+_payload_names[best]+' '+candidates[0][1]+'B  ('+
           candidates.map(function(c){return _payload_names[c[0]]+':'+c[1];}).join(' ')+')');
 
+        var a_type, a_bytes;
         if(best==1){
-          send_signal(MSGCODE_TYPE_MAP['ANSWER_RAW'],
-            litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(raw_answer_sdp)}));
+          a_type=MSGCODE_TYPE_MAP['ANSWER_RAW'];
+          a_bytes=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(raw_answer_sdp)});
         }else if(best==2){
-          send_signal(MSGCODE_TYPE_MAP['ANSWER_COMPACT'],
-            litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(min_viable_answer_sdp)}));
+          a_type=MSGCODE_TYPE_MAP['ANSWER_COMPACT'];
+          a_bytes=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(min_viable_answer_sdp)});
         }else if(best==3){
-          send_signal(MSGCODE_TYPE_MAP['ANSWER_DEFLATE'],
-            litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(deflate_answer_sdp)}));
+          a_type=MSGCODE_TYPE_MAP['ANSWER_DEFLATE'];
+          a_bytes=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(deflate_answer_sdp)});
         }else if(best==4){
-          send_signal(MSGCODE_TYPE_MAP['ANSWER_DIFF_DEFLATE'],
-            litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_deflate_answer_sdp)}));
+          a_type=MSGCODE_TYPE_MAP['ANSWER_DIFF_DEFLATE'];
+          a_bytes=litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_deflate_answer_sdp)});
         }else if(best==5){
-          send_signal(MSGCODE_TYPE_MAP['ANSWER_DIFF'],
-            litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_answer_sdp)}));
+          a_type=MSGCODE_TYPE_MAP['ANSWER_DIFF'];
+          a_bytes=litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_answer_sdp)});
         }
+        // Kept as sent: re-sent until NEGOTIATION_DONE arrives (resend_answer),
+        // and on a duplicate of the offer it answers (handle_duplicate_offer).
+        // A DIFF here is against the offer the peer sent — which stays its
+        // sent_local_offer_sdp until it offers again. Created before the first
+        // send, which records its chunk msg_id on it.
+        connection.last_answer_signal={ seq:seq, type:a_type, bytes:a_bytes };
+        send_signal(a_type,a_bytes,connection.last_answer_signal);
+        start_answer_resend(seq);
 
         
 
@@ -2493,7 +2989,14 @@ export function StableWebRTC(opts){
 
     function send_offer_raw(seq,raw_offer_sdp){
       var uint8buffer=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(raw_offer_sdp)});
-      send_signal(MSGCODE_TYPE_MAP['OFFER_RAW'],uint8buffer);
+      // Different bytes than the compact copy → a new slot (new chunk msg_id).
+      var raw_slot={ seq:seq, type:MSGCODE_TYPE_MAP['OFFER_RAW'], bytes:uint8buffer };
+      // The peer could not decode the compact form (FAILED_DECOMPRESS): any
+      // further re-send must be this RAW one, not the copy it failed on.
+      if(connection.last_offer_signal && connection.last_offer_signal.seq===seq){
+        connection.last_offer_signal=raw_slot;
+      }
+      send_signal(raw_slot.type,raw_slot.bytes,raw_slot);
     }
 
     function send_offer(seq,base_sdp,raw_offer_sdp){
@@ -2543,22 +3046,30 @@ export function StableWebRTC(opts){
         ev.emit('log','offer payload: '+_payload_names[best]+' '+candidates[0][1]+'B  ('+
           candidates.map(function(c){return _payload_names[c[0]]+':'+c[1];}).join(' ')+')');
 
+        var o_type, o_bytes;
         if(best==1){
-          send_signal(MSGCODE_TYPE_MAP['OFFER_RAW'],
-            litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(raw_offer_sdp)}));
+          o_type=MSGCODE_TYPE_MAP['OFFER_RAW'];
+          o_bytes=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(raw_offer_sdp)});
         }else if(best==2){
-          send_signal(MSGCODE_TYPE_MAP['OFFER_COMPACT'],
-            litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(min_viable_offer_sdp)}));
+          o_type=MSGCODE_TYPE_MAP['OFFER_COMPACT'];
+          o_bytes=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(min_viable_offer_sdp)});
         }else if(best==3){
-          send_signal(MSGCODE_TYPE_MAP['OFFER_DEFLATE'],
-            litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(deflate_offer_sdp)}));
+          o_type=MSGCODE_TYPE_MAP['OFFER_DEFLATE'];
+          o_bytes=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:seq,payload:toU8(deflate_offer_sdp)});
         }else if(best==4){
-          send_signal(MSGCODE_TYPE_MAP['OFFER_DIFF_DEFLATE'],
-            litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_deflate_offer_sdp)}));
+          o_type=MSGCODE_TYPE_MAP['OFFER_DIFF_DEFLATE'];
+          o_bytes=litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_deflate_offer_sdp)});
         }else if(best==5){
-          send_signal(MSGCODE_TYPE_MAP['OFFER_DIFF'],
-            litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_offer_sdp)}));
+          o_type=MSGCODE_TYPE_MAP['OFFER_DIFF'];
+          o_bytes=litepack.encode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,{seq:seq,base_hash:base_hash>>>0,result_hash:result_hash>>>0,payload:toU8(diff_offer_sdp)});
         }
+        // Kept as sent, for re-sending while no answer comes (resend_offer). The
+        // same bytes stay valid: a DIFF is against the peer's base, and the peer
+        // moves its base only by processing this very offer. Created BEFORE the
+        // first send so that send records its chunk msg_id on it (send_signal).
+        connection.last_offer_signal={ seq:seq, type:o_type, bytes:o_bytes };
+        send_signal(o_type,o_bytes,connection.last_offer_signal);
+        start_offer_resend(seq);
 
         
 
@@ -2722,6 +3233,124 @@ export function StableWebRTC(opts){
               //console.log('my offer:');
               //console.log(offer_modified);
 
+              // Sent: history, timers, state 2 — the same whether the offer
+              // was applied first or goes out unapplied (below).
+              function offer_ready(){
+                connection.sent_local_offer_sdp=offer_modified;
+              
+                connection.local_offer_history[this_offer_for_seq-1][0]=Date.now();
+
+                send_offer(this_offer_for_seq,connection.base_offer_sdp,offer_modified);
+
+                clearTimeout(connection.wait_for_answer_timeout_timer);
+                connection.wait_for_answer_timeout_timer=null;
+
+                var max_wait_time=7000;
+
+                // Adaptive: extend the timeout to the slowest observed answer
+                // plus 2s of headroom, so a consistently slow signaling path
+                // doesn't trip false rollbacks. Only the last 32 offers are
+                // consulted — recent history reflects the current network, and
+                // it keeps this O(1) per offer instead of O(all offers ever).
+                // NOTE: local_offer_history itself is never trimmed — the offer
+                // seq IS the array length (this_offer_for_seq above, and every
+                // seq==history.length check in the answer path), so truncating
+                // the array would corrupt sequencing. Entries are 3 numbers
+                // each; the memory cost of keeping them all is negligible.
+                var hist_start=Math.max(0, connection.local_offer_history.length-32);
+                for(var hi=hist_start; hi<connection.local_offer_history.length; hi++){
+                  if(connection.local_offer_history[hi][1]>0){
+                    var time_to_get_answer=connection.local_offer_history[hi][1]-connection.local_offer_history[hi][0];
+                    if(time_to_get_answer+2000>max_wait_time){
+                      max_wait_time=time_to_get_answer+2000;
+                    }
+                  }
+                }
+
+                // Add random jitter to prevent symmetric deadlocks
+                // where both peers timeout and retry at the exact same moment
+                max_wait_time += Math.floor(Math.random() * 500);
+
+                var this_wait_seq=connection.local_offer_history.length;
+                connection.wait_for_answer_timeout_timer=setTimeout(function on_wait_for_answer_timeout(){
+                  connection.wait_for_answer_timeout_timer=null;
+
+                  // The OPENING offer is not given up on while the peer may
+                  // still answer it. Giving up here (back to state 0) let the
+                  // next change — the camera, typically — go out as a fresh
+                  // opening offer with other m-lines, while the peer had
+                  // already applied the first one and answered it: the late
+                  // answer was then dropped ("answer for old offer"), the two
+                  // PeerConnections no longer described the same session, and
+                  // every later offer failed on the peer ("order of m-lines
+                  // doesn't match", "Failed to set SSL role", candidates for
+                  // unknown mids) — stuck until the app tore the connection
+                  // down 30s later. A signaling path that takes 7s+ for one
+                  // round (a relay link coming up, admission, retransmits)
+                  // was enough. Nothing is lost by waiting: the offer keeps
+                  // being re-sent, a polite peer's own offer still preempts
+                  // ours, and changes made meanwhile are latched and offered
+                  // once this round completes. Past opening_answer_wait_ms
+                  // (option openingAnswerWait, default 25s — keep it below the
+                  // app's own connect timeout) the old behaviour applies.
+                  if(connection.negotiation_state==2 && opening_phase() &&
+                     this_wait_seq===connection.local_offer_history.length){
+                    var sent_at=connection.local_offer_history[this_wait_seq-1] ? connection.local_offer_history[this_wait_seq-1][0] : 0;
+                    var left=sent_at>0 ? sent_at+connection.opening_answer_wait_ms-Date.now() : 0;
+                    if(left>0){
+                      _engine_diag('opening offer '+this_wait_seq+': no answer after '+Math.round((Date.now()-sent_at)/1000)+'s — still waiting (not rolling back), up to '+Math.round(left/1000)+'s more');
+                      // One timer to the cap; the answer clears it (state 2 → 3).
+                      connection.wait_for_answer_timeout_timer=setTimeout(on_wait_for_answer_timeout, left);
+                      return;
+                    }
+                  }
+
+                  if(connection.negotiation_state==2){
+                    // Reset base so next offer is sent RAW, not as diff against stale base
+                    connection.base_offer_sdp=null;
+                    rollback_signaling_to_stable(function(){
+                      set_connection_state({
+                        negotiation_state: 0
+                      });
+                    });
+                  }
+
+                },max_wait_time);
+
+                connection.create_offer_failures=0;
+                connection.need_reoffer=false;
+                set_connection_state({
+                  negotiation_state: 2
+                });
+              }
+
+              // OPENING OFFER, SENT UNAPPLIED.
+              //
+              // At the start neither side knows who is polite — the peer's
+              // nonce rides its first frame, and nothing has arrived yet. Both
+              // sides offer at once. Applying the offer first meant the side
+              // that turns out polite had to roll it back to take the other
+              // offer — a rollback on nearly every connection, and Chrome is
+              // fragile around those (the SCTP wedge, extmap ghosts). So the
+              // opening offer goes out WITHOUT setLocalDescription: the polite
+              // side just drops it — nothing to undo — and answers the other;
+              // the impolite side applies it as soon as it knows (the peer's
+              // offer arrives: process_income_offer), or right before the
+              // answer if that comes first (process_income_answer) — applying
+              // the last created offer later is plain JSEP. Two signaling
+              // trips, as if there had been no collision.
+              var defer_apply = opening_phase() && !offer_options.iceRestart && politeness_now()!==false;
+              if(defer_apply){
+                if(connection.local_support_trickle_ice==null){
+                  connection.local_support_trickle_ice=is_support_trickle_ice(offer_modified);
+                }
+                connection.offer_unapplied=true;
+                connection.unapplied_offer_sdp=offer_modified;
+                _engine_diag('create_offer: opening offer sent unapplied (politeness '+(politeness()===null?'unknown':'polite')+')');
+                offer_ready();
+                return;
+              }
+
               connection.pc.setLocalDescription(new RTCSessionDescription({ type: 'offer', sdp: offer_modified })).then(function(){
                 if(!pc_alive()) return;
 
@@ -2730,64 +3359,7 @@ export function StableWebRTC(opts){
                 }
 
                 if(connection.negotiation_state==1 && connection.pc.localDescription && this_offer_for_seq==connection.local_offer_history.length){
-
-                  connection.sent_local_offer_sdp=offer_modified;
-                  
-                  connection.local_offer_history[this_offer_for_seq-1][0]=Date.now();
-
-                  send_offer(this_offer_for_seq,connection.base_offer_sdp,offer_modified);
-
-                  clearTimeout(connection.wait_for_answer_timeout_timer);
-                  connection.wait_for_answer_timeout_timer=null;
-
-                  var max_wait_time=7000;
-
-                  // Adaptive: extend the timeout to the slowest observed answer
-                  // plus 2s of headroom, so a consistently slow signaling path
-                  // doesn't trip false rollbacks. Only the last 32 offers are
-                  // consulted — recent history reflects the current network, and
-                  // it keeps this O(1) per offer instead of O(all offers ever).
-                  // NOTE: local_offer_history itself is never trimmed — the offer
-                  // seq IS the array length (this_offer_for_seq above, and every
-                  // seq==history.length check in the answer path), so truncating
-                  // the array would corrupt sequencing. Entries are 3 numbers
-                  // each; the memory cost of keeping them all is negligible.
-                  var hist_start=Math.max(0, connection.local_offer_history.length-32);
-                  for(var hi=hist_start; hi<connection.local_offer_history.length; hi++){
-                    if(connection.local_offer_history[hi][1]>0){
-                      var time_to_get_answer=connection.local_offer_history[hi][1]-connection.local_offer_history[hi][0];
-                      if(time_to_get_answer+2000>max_wait_time){
-                        max_wait_time=time_to_get_answer+2000;
-                      }
-                    }
-                  }
-
-                  // Add random jitter to prevent symmetric deadlocks
-                  // where both peers timeout and retry at the exact same moment
-                  max_wait_time += Math.floor(Math.random() * 500);
-
-                  connection.wait_for_answer_timeout_timer=setTimeout(function(){
-                    connection.wait_for_answer_timeout_timer=null;
-                    
-                    if(connection.negotiation_state==2){
-                      // Reset base so next offer is sent RAW, not as diff against stale base
-                      connection.base_offer_sdp=null;
-                      rollback_signaling_to_stable(function(){
-                        set_connection_state({
-                          negotiation_state: 0
-                        });
-                      });
-                    }
-
-                  },max_wait_time);
-
-                  connection.create_offer_failures=0;
-                  connection.need_reoffer=false;
-                  set_connection_state({
-                    negotiation_state: 2
-                  });
-                  
-
+                  offer_ready();
                 }else{
                   //not relevant...
                 }
@@ -2833,6 +3405,169 @@ export function StableWebRTC(opts){
     }
 
 
+    // ======================================================================
+    // Offer / answer reliability over the DataChannel
+    //
+    // Signaling on the DC is UDP-like (maxRetransmits:0, unordered): a lost
+    // offer, answer or NEGOTIATION_DONE used to be noticed only by the
+    // pending-offer timeout (max_wait_time, 7s+), and a lost DONE not at all —
+    // DONE is what carries epoch_negotiation_success to the answerer, and the
+    // two sides then disagree on politeness_now (who yields in a glare). The
+    // external path doesn't need any of this (its transport is reliable), and
+    // re-sending there is merely redundant.
+    //
+    //   offerer   re-sends its offer while it waits (state 2, same seq)
+    //   answerer  re-sends its answer while it waits for DONE (state 5)
+    //   answerer  answers a DUPLICATE offer with the stored answer — never
+    //             re-processes it
+    //   offerer   answers a DUPLICATE answer of a completed negotiation with
+    //             DONE again — so a lost DONE is recovered by the answerer's
+    //             own re-sends, with no new message type
+    //
+    // No wire change: same message types, same schemas. A peer without this
+    // just logs the duplicates, and the 7s timeout stays everyone's last resort.
+    // ======================================================================
+
+    var NEG_RESEND_MAX_WAIT = 3000;
+
+    // The wait before re-sending an offer: an answer takes the peer one round
+    // trip PLUS setRemoteDescription / createAnswer / setLocalDescription — so
+    // never below how long the last answer actually took to come back.
+    function offer_resend_delay(attempts){
+      var base=rto(300,2000,1000);
+      for(var hi=connection.local_offer_history.length-1; hi>=0; hi--){
+        var h=connection.local_offer_history[hi];
+        if(h[1]>0 && h[0]>0){ base=Math.max(base, Math.round((h[1]-h[0])*1.25)); break; }
+      }
+      return Math.min(NEG_RESEND_MAX_WAIT, base*Math.pow(2, Math.min(attempts,5)));
+    }
+
+    function stop_offer_resend(){
+      clearTimeout(connection.offer_resend_timer);
+      connection.offer_resend_timer=null;
+    }
+    function start_offer_resend(seq){
+      stop_offer_resend();
+      connection.offer_resend_attempts=0;
+      schedule_offer_resend(seq);
+    }
+    function schedule_offer_resend(seq){
+      connection.offer_resend_timer=setTimeout(function(){
+        connection.offer_resend_timer=null;
+        var o=connection.last_offer_signal;
+        // Only the offer we are still waiting on. State 2 is left by the answer
+        // (→3), by the pending-offer timeout (rollback →0), or by the peer's
+        // competing offer (glare →4): each of those ends the re-sending.
+        if(!pc_alive() || !o || o.seq!==seq) return;
+        if(connection.negotiation_state!==2 || seq!==connection.local_offer_history.length) return;
+        connection.offer_resend_attempts++;
+        ev.emit('log','offer '+seq+': no answer yet — re-sending (#'+connection.offer_resend_attempts+')');
+        send_signal(o.type,o.bytes,o);
+        schedule_offer_resend(seq);
+      }, offer_resend_delay(connection.offer_resend_attempts));
+    }
+
+    function stop_answer_resend(){
+      clearTimeout(connection.answer_resend_timer);
+      connection.answer_resend_timer=null;
+    }
+    function start_answer_resend(seq){
+      stop_answer_resend();
+      connection.answer_resend_attempts=0;
+      schedule_answer_resend(seq);
+    }
+    function schedule_answer_resend(seq){
+      var delay=Math.min(NEG_RESEND_MAX_WAIT, rto(300,2000,1000)*Math.pow(2, Math.min(connection.answer_resend_attempts,5)));
+      connection.answer_resend_timer=setTimeout(function(){
+        connection.answer_resend_timer=null;
+        var a=connection.last_answer_signal;
+        if(!pc_alive() || !a || a.seq!==seq) return;
+        // Waiting for DONE for THIS offer. A newer offer from the peer moves
+        // seq_remote_offer on; DONE (or the state-5 timeout) moves the state.
+        if(connection.negotiation_state!==5 || seq!==connection.seq_remote_offer) return;
+        connection.answer_resend_attempts++;
+        ev.emit('log','answer '+seq+': no NEGOTIATION_DONE yet — re-sending (#'+connection.answer_resend_attempts+')');
+        send_signal(a.type,a.bytes,a);
+        schedule_answer_resend(seq);
+      }, delay);
+    }
+
+    // An offer whose seq we have already seen. Returns true when handled — the
+    // caller then skips decoding it (a DIFF of a duplicate would fail against
+    // our base, which moved when we processed the original, and draw a
+    // pointless FAILED_DECOMPRESS round).
+    // How long a dropped offer may keep coming back before we yield: three
+    // signaling round trips as last measured (offer sent → its answer), at
+    // least 2s; GLARE_YIELD_MS until one has been measured. The data
+    // channel's srtt is not the path offers travel before it exists — or
+    // when it is down — so the offer history is the sample used.
+    function last_signaling_round_ms(){
+      for(var hi=connection.local_offer_history.length-1; hi>=0; hi--){
+        var h=connection.local_offer_history[hi];
+        if(h[1]>0 && h[0]>0) return h[1]-h[0];
+      }
+      return null;
+    }
+    function glare_yield_ms(){
+      var r=last_signaling_round_ms();
+      return r==null ? GLARE_YIELD_MS : Math.max(2000, 3*r);
+    }
+
+    function handle_duplicate_offer(seq){
+      // Glare that does not resolve. We are impolite and dropped their offer;
+      // the polite side should have rolled back on receiving ours and
+      // answered it. If instead its offer keeps coming back (re-sent while it
+      // waits for OUR answer) and ours is still unanswered, the two sides
+      // disagree about who is polite — a peer nonce latched from a stale
+      // session, say. Waiting changes nothing: both would re-offer forever.
+      // So, after GLARE_YIELD_MS with re-sends still arriving, we yield: roll
+      // ours back and answer theirs. The worst case of both yielding at once
+      // is one wasted round; the next collision is decided by the roles.
+      var g=connection.glare_ignored;
+      if(g && g.seq===seq && seq===connection.seq_remote_offer && connection.negotiation_state===2){
+        g.dups++;
+        if(g.dups>=2 && Date.now()-g.at>=glare_yield_ms()){
+          ev.emit('log','offer '+seq+': glare did not resolve in '+Math.round((Date.now()-g.at)/1000)+'s — yielding: rolling ours back, answering theirs');
+          connection.glare_ignored=null;
+          connection.force_yield=true;
+          connection.pending_remote_offer_sdp=g.sdp;
+          set_remote_offer();
+          return true;
+        }
+      }
+      if(!(seq<=connection.seq_remote_offer)) return false;
+      var a=connection.last_answer_signal;
+      if(seq===connection.seq_remote_offer && a && a.seq===seq){
+        // We answered it; the answer must have been lost. Same answer, again.
+        ev.emit('log','offer '+seq+' again — re-sending our answer');
+        send_signal(a.type,a.bytes,a);
+      }else{
+        // Still being processed (state 4), dropped in a glare, or older than
+        // the current one: nothing to send.
+        ev.emit('log','offer '+seq+' is old or already being handled — ignored');
+      }
+      return true;
+    }
+
+    // An answer for a negotiation we already completed. Returns true when
+    // handled. The answerer re-sends its answer only while it has no DONE —
+    // so this is our DONE that got lost: send it again (with the current
+    // epoch, which is what the answerer is missing).
+    function handle_duplicate_answer(seq){
+      if(!(seq>=1 && seq<=connection.local_offer_history.length)) return false;
+      if(connection.negotiation_state===2 || connection.negotiation_state===3) return false;   // live answer path
+      var h=connection.local_offer_history[seq-1];
+      // A LATE answer (we already timed out and rolled back) still tells how
+      // long answers take here — the adaptive max_wait_time reads it, as
+      // process_income_answer always recorded it.
+      if(h && h[1]==0) h[1]=Date.now();
+      if(seq===connection.local_offer_history.length && h && h[2]>0){
+        ev.emit('log','answer '+seq+' again — re-sending NEGOTIATION_DONE');
+        send_negotiation_done(seq);
+      }
+      return true;   // completed or superseded — never re-apply an answer
+    }
+
     function send_failed_decompress(type,seq){
       var uint8buffer=litepack.encode(SCHEMA_FAILED_DECOMPRESS,{failed_type:type,seq:seq});
       send_signal(MSGCODE_TYPE_MAP['FAILED_DECOMPRESS'],uint8buffer);
@@ -2853,7 +3588,17 @@ export function StableWebRTC(opts){
       return Math.min(connection.max_signal_chunk_size, mms);
     }
 
-    function send_signal(type,data){
+    // `slot` (optional): a stored message that may be sent more than once with
+    // the SAME bytes — last_offer_signal, last_answer_signal, the pending
+    // MEDIASTREAM_MAP. Its chunk msg_id is kept on it, per pipe, and reused on
+    // every re-send: the receiver's reassembly (chunking.js) then merges the
+    // pieces of all copies under one id — a piece lost from one copy is filled
+    // by the next, instead of every copy having to arrive complete on its own.
+    // A slot is only ever re-sent with identical bytes (a different message is
+    // a new slot object, hence a new id). The id is reused only while the piece
+    // size is unchanged: a different size means a different `total`, which the
+    // reassembler rejects for an existing id (chunking.js — mismatched total).
+    function send_signal(type,data,slot){
 
       // The DC rides the very transport that signaling sometimes needs to
       // repair. readyState stays 'open' while ICE dies underneath it (SCTP
@@ -2865,9 +3610,18 @@ export function StableWebRTC(opts){
       // path below ('signal' event → app's WebSocket/other) exists exactly
       // for this.
       var ice_state=connection.pc ? connection.pc.iceConnectionState : null;
-      var transport_down=(ice_state==='disconnected' || ice_state==='failed');
+      // signal_dc_suspect (check_liveness): the DC is silent although ICE says
+      // connected — signaling goes external. Except PING / PONG: they must keep
+      // probing the DC itself (their arrival is what clears the flag), and an
+      // RTT measured over the external path would poison srtt.
+      var is_probe=(type===MSGCODE_TYPE_MAP['PING'] || type===MSGCODE_TYPE_MAP['PONG']);
+      var transport_down=(ice_state==='disconnected' || ice_state==='failed' ||
+                          (connection.signal_dc_suspect===true && !is_probe));
 
       var data_channel_open=(transport_down===false && connection.data_channel_primary_index!==null && connection.list_data_channels[connection.data_channel_primary_index] && connection.list_data_channels[connection.data_channel_primary_index].readyState=='open' && connection.data_channel_state=='open');
+      if(T && type!==MSGCODE_TYPE_MAP['PING'] && type!==MSGCODE_TYPE_MAP['PONG']){
+        T.rec('signal.out', { type: msgcode_name(type), bytes: data && data.byteLength, via: data_channel_open ? 'dc' : 'ext' });
+      }
 
       if(data_channel_open==true){
 
@@ -2880,7 +3634,13 @@ export function StableWebRTC(opts){
           // type SIGNAL_CHUNK. App DATA never reaches here, so it's never split.
           // All fragments enter the same priority lane back-to-back, so they are
           // never interleaved with (or starved by) queued app data.
-          var mid_i=(connection.chunk_send_id_internal=(connection.chunk_send_id_internal+1)&0xFFFF);
+          var mid_i;
+          if(slot && slot.mid_i!=null && slot.mid_i_limit===ilimit){
+            mid_i=slot.mid_i;                       // same message, same pieces — fill the holes
+          }else{
+            mid_i=(connection.chunk_send_id_internal=(connection.chunk_send_id_internal+1)&0xFFFF);
+            if(slot){ slot.mid_i=mid_i; slot.mid_i_limit=ilimit; }
+          }
           var pieces_i=build_chunks(uint8buffer,ilimit,mid_i);
           for(var pi=0;pi<pieces_i.length;pi++){
             data_channel_send_signal(litepack.encode(SCHEMA_DC_MSG,{type:MSGCODE_TYPE_MAP['SIGNAL_CHUNK'],data:pieces_i[pi]}));
@@ -2896,7 +3656,17 @@ export function StableWebRTC(opts){
         if(data2.byteLength+1<=elimit){
           ev.emit('signal',litepack.encode(SCHEMA_SIGNAL_FRAME,{kind:0,body:data2}));   // whole
         }else{
-          var mid_e=(connection.chunk_send_id_external=(connection.chunk_send_id_external+1)&0xFFFF);
+          // The external envelope carries the current nonces (data1 above), so
+          // its bytes — and so its pieces — can differ between two sends of the
+          // same slot: reuse the id only when the envelope is byte-identical.
+          var env_hash=checksum_hash>>>0;
+          var mid_e;
+          if(slot && slot.mid_e!=null && slot.mid_e_limit===elimit && slot.mid_e_hash===env_hash && slot.mid_e_len===data2.byteLength){
+            mid_e=slot.mid_e;
+          }else{
+            mid_e=(connection.chunk_send_id_external=(connection.chunk_send_id_external+1)&0xFFFF);
+            if(slot){ slot.mid_e=mid_e; slot.mid_e_limit=elimit; slot.mid_e_hash=env_hash; slot.mid_e_len=data2.byteLength; }
+          }
           var pieces_e=build_chunks(data2,elimit,mid_e);
           for(var pe=0;pe<pieces_e.length;pe++){
             ev.emit('signal',litepack.encode(SCHEMA_SIGNAL_FRAME,{kind:1,body:pieces_e[pe]}));
@@ -2907,12 +3677,16 @@ export function StableWebRTC(opts){
     }
 
     function process_income_signal(type,data){
+      if(T && type!==MSGCODE_TYPE_MAP['PING'] && type!==MSGCODE_TYPE_MAP['PONG']){
+        T.rec('signal.in', { type: msgcode_name(type), bytes: data && data.byteLength });
+      }
       
       if(type>=MSGCODE_TYPE_MAP['OFFER_RAW'] && type<=MSGCODE_TYPE_MAP['OFFER_DIFF_DEFLATE']){//offer
 
         if(type==MSGCODE_TYPE_MAP['OFFER_DIFF_DEFLATE'] || type==MSGCODE_TYPE_MAP['OFFER_DIFF']){
           var b=litepack.decode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,data);
           var seq=b.seq;
+          if(handle_duplicate_offer(seq)) return;
 
           if(murmurhash3_str(connection.base_offer_sdp)==b.base_hash){
             if(type==MSGCODE_TYPE_MAP['OFFER_DIFF_DEFLATE']){//DIFF + DEFLATE
@@ -2950,6 +3724,7 @@ export function StableWebRTC(opts){
         }else{
           var b=litepack.decode(SCHEMA_SEQ_PAYLOAD,data);
           var seq=b.seq;
+          if(handle_duplicate_offer(seq)) return;
 
           if(type==MSGCODE_TYPE_MAP['OFFER_RAW']){//RAW
             process_income_offer(_TD.decode(b.payload),seq);
@@ -2971,6 +3746,7 @@ export function StableWebRTC(opts){
         if(type==MSGCODE_TYPE_MAP['ANSWER_DIFF_DEFLATE'] || type==MSGCODE_TYPE_MAP['ANSWER_DIFF']){
           var b=litepack.decode(SCHEMA_SEQ_HASH_HASH_PAYLOAD,data);
           var seq=b.seq;
+          if(handle_duplicate_answer(seq)) return;
 
           if(murmurhash3_str(connection.sent_local_offer_sdp)==b.base_hash){
             if(type==MSGCODE_TYPE_MAP['ANSWER_DIFF_DEFLATE']){//DIFF + DEFLATE
@@ -3010,6 +3786,7 @@ export function StableWebRTC(opts){
         }else{
           var b=litepack.decode(SCHEMA_SEQ_PAYLOAD,data);
           var seq=b.seq;
+          if(handle_duplicate_answer(seq)) return;
 
           if(type==MSGCODE_TYPE_MAP['ANSWER_RAW']){//RAW
             process_income_answer(_TD.decode(b.payload),seq);
@@ -3120,13 +3897,13 @@ export function StableWebRTC(opts){
         // sender's clock reading, which only the sender interprets.
         try{
           var pingb=litepack.decode(SCHEMA_PING,data);
-          send_signal(MSGCODE_TYPE_MAP['PONG'],litepack.encode(SCHEMA_PING,{timestamp:pingb.timestamp}));
+          send_signal(MSGCODE_TYPE_MAP['PONG'],litepack.encode(SCHEMA_PONG,{timestamp:pingb.timestamp,peer_time:Date.now()}));
         }catch(error){}
 
       }else if(type==MSGCODE_TYPE_MAP['PONG']){//pong
         // Our own timestamp came back. rtt = now - then, measured on one clock.
         try{
-          var pongb=litepack.decode(SCHEMA_PING,data);
+          var pongb=litepack.decode(SCHEMA_PONG,data);
           var rtt=Date.now()-pongb.timestamp;
           if(rtt>=0 && rtt<600000){           // sanity bound: ignore absurd values
             // App-level RTT (full DataChannel round-trip). Kept SEPARATE from
@@ -3134,7 +3911,30 @@ export function StableWebRTC(opts){
             // lower-level ICE/DTLS RTT. Conflating them would make either field
             // flip between two different measurements every poll.
             connection.current_ping_rtt=rtt;
-            ev.emit('rtt', rtt);
+            rtt_sample(rtt);
+            // The lowest round trip seen on this path: what the line itself
+            // takes, without any queue in the way. Reset with srtt when the
+            // selected path changes.
+            if(connection.min_rtt==null || rtt<connection.min_rtt) connection.min_rtt=rtt;
+            // 2nd argument: the smoothed estimate (rtt_sample) — the stable value
+            // to show or to compute with. The 1st stays the raw sample, so
+            // existing listeners see exactly what they always did.
+            // The peer's clock minus ours: it read peer_time halfway through
+            // the round trip, give or take rtt/2 — so the estimate from the
+            // shortest round trip is the one kept.
+            var clock_offset=pongb.peer_time - Math.round((pongb.timestamp + pongb.timestamp + rtt)/2);
+            if(connection.clock_offset_rtt==null || rtt<=connection.clock_offset_rtt){
+              connection.clock_offset=clock_offset;
+              connection.clock_offset_rtt=rtt;
+            }
+            ev.emit('rtt', rtt, {
+              srtt:   Math.round(connection.srtt),
+              rttvar: Math.round(connection.rttvar),
+              min_rtt: connection.min_rtt,
+              sample: rtt,
+              clock_offset: connection.clock_offset,   // peer's clock − ours (ms), ± clock_offset_rtt/2
+              clock_offset_rtt: connection.clock_offset_rtt
+            });
           }
         }catch(error){}
 
@@ -3161,8 +3961,20 @@ export function StableWebRTC(opts){
         if(_env.checksum==murmurhash3_data(_env.payload)){
           var _inn=litepack.decode(SCHEMA_SIGNAL_INNER,_env.payload);
 
-          if(connection.remote_nonce==0 && _inn.local_nonce>0){
+          // Adopt the peer's nonce only from a frame that was meant for US: one
+          // whose remote_nonce is 0 (the peer hasn't heard from anyone yet) or
+          // is our own nonce. A frame carrying some OTHER remote_nonce was
+          // addressed to a previous instance of us — the peer's old session,
+          // still talking to the page we replaced. Latching its nonce glued a
+          // fresh instance to a session that is about to die: every real frame
+          // from the peer's new session then failed the check, the mismatch
+          // streak closed us, our replacement latched the next stale frame, and
+          // the two sides chased each other through new instances forever
+          // (Chrome simulation: refresh mid-call recovered 1 of 6 times).
+          if(connection.remote_nonce==0 && _inn.local_nonce>0 &&
+             (_inn.remote_nonce==0 || _inn.remote_nonce==connection.local_nonce)){
             connection.remote_nonce=_inn.local_nonce;
+            if(T) trace_peer();
           }
 
           var sctp_not_ready=(!connection.pc || !connection.pc.sctp || !connection.pc.sctp.maxChannels || (connection.pc.sctp.maxMessageSize===Infinity) || !connection.pc.sctp.maxMessageSize);
@@ -3178,7 +3990,16 @@ export function StableWebRTC(opts){
             // peer has restarted with a fresh nonce and will never match again:
             // close so the app can reconnect with a new instance (see the field
             // comments on nonce_mismatch_streak_*).
-            if(_inn.local_nonce>0 && _inn.local_nonce!==connection.remote_nonce){
+            //
+            // Only an instance that HAS a peer can conclude its peer restarted
+            // (remote_nonce != 0). A fresh instance that never heard from anyone
+            // is the restart — frames with a foreign nonce reaching it are the
+            // peer's OLD session talking to our predecessor. Counting them made
+            // the new instance close ITSELF after 5 of them; its replacement had
+            // a new nonce, which reset the streak on the peer's old instance,
+            // so that one never closed and the two never met again (Chrome
+            // simulation: leave 5s and come back — 0 of 6 reconnected).
+            if(connection.remote_nonce!==0 && _inn.local_nonce>0 && _inn.local_nonce!==connection.remote_nonce){
               if(connection.nonce_mismatch_streak_nonce===_inn.local_nonce){
                 connection.nonce_mismatch_streak_count++;
               }else{
@@ -3437,30 +4258,94 @@ export function StableWebRTC(opts){
       connection.seq_local_mediastream_map++;
 
       var uint8buffer=litepack.encode(SCHEMA_SEQ_PAYLOAD,{seq:connection.seq_local_mediastream_map,payload:toU8(json_str)});
-      send_signal(MSGCODE_TYPE_MAP['MEDIASTREAM_MAP'],uint8buffer);
 
       // B2 reliability: hold this map until the peer ACKs its seq. A newer map
       // (higher seq) replaces this pending entry and restarts the schedule.
+      // Created before the first send, which records its chunk msg_id on it.
       connection.mediastream_map_pending={ seq:connection.seq_local_mediastream_map, bytes:uint8buffer, attempts:0 };
+      send_signal(MSGCODE_TYPE_MAP['MEDIASTREAM_MAP'],uint8buffer,connection.mediastream_map_pending);
       schedule_mediastream_map_retransmit();
     }
 
-    // Backoff schedule for re-sending an un-acked MEDIASTREAM_MAP.
-    var MEDIASTREAM_MAP_BACKOFF=[500,1000,2000,4000,4000]; // 5 attempts, then give up
+    // ---- Retransmit timing from the measured round-trip ----
+    //
+    // Same estimator as TCP (RFC 6298): a smoothed RTT and its variation, fed
+    // by our own PING/PONG — a full DataChannel round-trip, the very path an
+    // un-acked signal and its ACK travel. Not fed by getStats' current_rtt:
+    // that one is the ICE/DTLS round-trip, a different measurement (see the
+    // PONG handler — the two are kept apart on purpose).
+    //
+    // Smoothing matters: one late sample doesn't stretch every wait, and a
+    // jittery line (RTT jumping around) gets a longer wait through rttvar
+    // without anyone tuning anything.
+    function rtt_sample(ms){
+      if(!(ms>=0)) return;
+      if(connection.srtt==null){
+        connection.srtt=ms;
+        connection.rttvar=ms/2;
+      }else{
+        connection.rttvar=0.75*connection.rttvar + 0.25*Math.abs(connection.srtt-ms);
+        connection.srtt=0.875*connection.srtt + 0.125*ms;
+      }
+    }
+
+    // How long to wait for an answer to something we just sent, before sending
+    // it again: SRTT + 4·RTTVAR, clamped to [min_ms, max_ms]. Before any
+    // ping/pong has come back: twice the ICE round-trip if getStats has one,
+    // else `fallback_ms`. Callers apply their own backoff on top.
+    function rto(min_ms, max_ms, fallback_ms){
+      var t;
+      if(connection.srtt!=null){
+        t=connection.srtt + 4*connection.rttvar;
+      }else if(connection.current_rtt>0){
+        t=2*connection.current_rtt;
+      }else{
+        t=fallback_ms;
+      }
+      return Math.round(Math.min(max_ms, Math.max(min_ms, t)));
+    }
+
+    // Re-sending an un-acked MEDIASTREAM_MAP. First wait from the round-trip
+    // (rto: 200ms–1s, 500ms before anything is measured), doubling on each
+    // retry up to MEDIASTREAM_MAP_MAX_WAIT — and from there it keeps re-sending
+    // at that pace for as long as the PC lives: it NEVER gives up.
+    //
+    // It used to give up after 5 attempts (~11.5s), and that was a dead end:
+    // send_mediastream_map() skips a map identical to the last one sent
+    // (_last_sent_mediastream_map), so once every copy was lost nothing ever
+    // sent it again — the peer never learned which MIDs carry which tag_id,
+    // and the stream stayed unbound on its side (media arriving, no `stream`
+    // event) until the map happened to change. Precisely the bad-line case:
+    // heavy loss, or the window where ICE is dead but not yet reported so
+    // (the DC reads 'open' through it — see send_signal). The map is a few
+    // bytes; one copy every 4s until it is acked costs nothing.
+    var MEDIASTREAM_MAP_MAX_WAIT=4000;
     function schedule_mediastream_map_retransmit(){
       if(connection.mediastream_map_ack_timer){ clearTimeout(connection.mediastream_map_ack_timer); connection.mediastream_map_ack_timer=null; }
       var p=connection.mediastream_map_pending;
       if(!p) return;
-      if(p.attempts>=MEDIASTREAM_MAP_BACKOFF.length){ connection.mediastream_map_pending=null; return; }
-      var delay=MEDIASTREAM_MAP_BACKOFF[p.attempts];
+      if(!pc_alive()){ connection.mediastream_map_pending=null; return; }   // connection gone — nothing to deliver to
+      var delay=Math.min(MEDIASTREAM_MAP_MAX_WAIT, rto(200,1000,500) * Math.pow(2, Math.min(p.attempts, 5)));
       connection.mediastream_map_ack_timer=setTimeout(function(){
         connection.mediastream_map_ack_timer=null;
         var pp=connection.mediastream_map_pending;
         if(!pp) return;                                  // acked or superseded
+        if(!pc_alive()){ connection.mediastream_map_pending=null; return; }
         pp.attempts++;
-        send_signal(MSGCODE_TYPE_MAP['MEDIASTREAM_MAP'],pp.bytes); // resend same seq
+        send_signal(MSGCODE_TYPE_MAP['MEDIASTREAM_MAP'],pp.bytes,pp); // resend same seq, same chunk msg_id
         schedule_mediastream_map_retransmit();
       },delay);
+    }
+
+    // Send the CURRENT map again under a new seq, even though it did not change.
+    // For after a recovery: whatever happened to the map while the link was
+    // down, the peer gets the full snapshot now (snapshots are idempotent — a
+    // peer that already had it just applies the same thing and acks). Nothing
+    // to do if no map was ever sent.
+    function resend_mediastream_map(){
+      if(connection._last_sent_mediastream_map==null) return;
+      connection._last_sent_mediastream_map=null;   // defeat the "unchanged" skip
+      send_mediastream_map();
     }
 
 
@@ -3873,14 +4758,22 @@ export function StableWebRTC(opts){
           }
         }
 
+        // Video limits for this stream's sender — applied by
+        // update_all_mediastream_senders() via sender.setParameters (maxFramerate /
+        // maxBitrate / scaleResolutionDownBy), no renegotiation. 0 = no limit;
+        // scale 1 = full resolution. A change re-runs the sender update.
         if ('max_video_fps' in options){
-
+          var fps = Math.max(0, Number(options.max_video_fps) || 0);
+          if (rec.max_video_fps !== fps){ rec.max_video_fps = fps; need_update = true; }
         }
         if ('max_video_bitrate' in options){
-          
+          var br = Math.max(0, Math.floor(Number(options.max_video_bitrate) || 0));
+          if (rec.max_video_bitrate !== br){ rec.max_video_bitrate = br; need_update = true; }
         }
         if ('video_scale_down' in options){
-          
+          var sc = Number(options.video_scale_down);
+          sc = (sc >= 1) ? sc : 1;
+          if (rec.video_scale_down !== sc){ rec.video_scale_down = sc; need_update = true; }
         }
       }
 
@@ -3930,12 +4823,27 @@ export function StableWebRTC(opts){
           }
         }
 
-        set_sending_stream(for_tag_id, {
+        set_sending_stream(for_tag_id, with_stream_options(options, {
           video_track: video_track,
           audio_track: audio_track
-        });
+        }));
 
       }
+    }
+
+    // The per-stream options a caller passed to addStream / addTrack (the video
+    // limits: max_video_fps, max_video_bitrate, video_scale_down), carried into
+    // set_sending_stream together with the tracks. Only those keys: the tracks
+    // and ids are decided by addStream / addTrack themselves.
+    var STREAM_OPTION_KEYS = ['max_video_fps', 'max_video_bitrate', 'video_scale_down'];
+    function with_stream_options(options, base){
+      if (options && typeof options === 'object'){
+        for (var i = 0; i < STREAM_OPTION_KEYS.length; i++){
+          var k = STREAM_OPTION_KEYS[i];
+          if (k in options) base[k] = options[k];
+        }
+      }
+      return base;
     }
 
     function removeStream(stream){
@@ -3987,13 +4895,13 @@ export function StableWebRTC(opts){
         if(track && isMediaStreamTrack(track)){
           if('kind' in track){
             if(track.kind=='audio'){
-              set_sending_stream(for_tag_id, {
+              set_sending_stream(for_tag_id, with_stream_options(options, {
                 audio_track: track,
-              });
+              }));
             }else if(track.kind=='video'){
-              set_sending_stream(for_tag_id, {
+              set_sending_stream(for_tag_id, with_stream_options(options, {
                 video_track: track,
-              });
+              }));
             }
           }
         }
@@ -4380,10 +5288,32 @@ export function StableWebRTC(opts){
         wait_time=Math.max(wait_time,250);
       }
 
-      connection.data_channel_pump_queue_timer=setTimeout(function(){
+      // Nothing to wait for: the next task, not a zero-delay timer — which
+      // in a hidden tab runs at most once a second, so every message (a PONG
+      // too, and with it the measured RTT) waited up to that long. See
+      // defer_task in util.js. A real wait stays a timer.
+      if(wait_time<=0){
+        var pump_cancel=defer_task(function(){
+          connection.data_channel_pump_queue_timer=null;
+          data_channel_pump_queue();
+        });
+        connection.data_channel_pump_queue_timer={ cancel: pump_cancel };
+      }else{
+        var pump_h=setTimeout(function(){
+          connection.data_channel_pump_queue_timer=null;
+          data_channel_pump_queue();
+        }, wait_time);
+        connection.data_channel_pump_queue_timer={ cancel: function(){ clearTimeout(pump_h); } };
+      }
+    }
+
+    // The pump's pending tick — a timer or a deferred task (see above).
+    function cancel_pump_timer(){
+      var t=connection.data_channel_pump_queue_timer;
+      if(t!==null){
         connection.data_channel_pump_queue_timer=null;
-        data_channel_pump_queue();
-      }, wait_time);
+        t.cancel();
+      }
     }
 
     // Drops queued messages that have waited longer than data_channel_max_queue_age and
@@ -4671,6 +5601,7 @@ export function StableWebRTC(opts){
     }
 
     function data_channel_send_data(data,callback){
+      if(T) T_data_out++;
       var uint8buffer=litepack.encode(SCHEMA_DC_MSG,{type:0,data:data instanceof Uint8Array?data:toU8(data)});
       data_channel_send(uint8buffer,callback);
     }
@@ -4722,10 +5653,7 @@ export function StableWebRTC(opts){
       // Preempt a parked tick. The pending timer may be a data-lane wait (rate
       // limit, up to 60ms) or the paused slow beat (250ms) — a signal must not
       // inherit either. Rescheduling with a signal pending computes ~0ms.
-      if(connection.data_channel_pump_queue_timer!==null){
-        clearTimeout(connection.data_channel_pump_queue_timer);
-        connection.data_channel_pump_queue_timer=null;
-      }
+      cancel_pump_timer();
       data_channel_schedule_pump();
     }
 
@@ -4744,20 +5672,17 @@ export function StableWebRTC(opts){
 
         // A paused tick may be parked on the slow 250ms beat — kill it so
         // sending resumes immediately rather than on the next beat.
-        if(connection.data_channel_pump_queue_timer!==null){
-          clearTimeout(connection.data_channel_pump_queue_timer);
-          connection.data_channel_pump_queue_timer=null;
-        }
+        cancel_pump_timer();
         data_channel_schedule_pump();
       }
     }
 
 
     function close_connection(){
-      clearTimeout(connection.create_data_channel_timer);
+      disarm(connection.create_data_channel_timer);
       connection.create_data_channel_timer=null;
 
-      clearTimeout(connection.create_offer_timer);
+      disarm(connection.create_offer_timer);
       connection.create_offer_timer=null;
 
       clearTimeout(connection.wait_for_answer_timeout_timer);
@@ -4769,8 +5694,7 @@ export function StableWebRTC(opts){
       clearTimeout(connection.getstats_timer);
       connection.getstats_timer=null;
 
-      clearTimeout(connection.data_channel_pump_queue_timer);
-      connection.data_channel_pump_queue_timer=null;
+      cancel_pump_timer();
 
       clearTimeout(connection.remove_unused_tracks_timer);
       connection.remove_unused_tracks_timer=null;
@@ -4786,6 +5710,10 @@ export function StableWebRTC(opts){
       clearTimeout(connection.mediastream_map_ack_timer);
       connection.mediastream_map_ack_timer=null;
       connection.mediastream_map_pending=null;
+      stop_offer_resend();
+      stop_answer_resend();
+      connection.last_offer_signal=null;
+      connection.last_answer_signal=null;
 
       clearTimeout(connection.ping_timer);
       connection.ping_timer=null;
@@ -4800,12 +5728,15 @@ export function StableWebRTC(opts){
 
       if(connection.pc){
                         
-        if(connection.pc.sctp){
-          connection.pc.sctp.onstatechange=null;
-          if(connection.pc.sctp.transport){
-            connection.pc.sctp.transport.onstatechange=null;
-            if(connection.pc.sctp.transport.iceTransport){
-                connection.pc.sctp.transport.iceTransport.onstatechange=null;
+        // The handlers were set on the transports captured in connection.sctp;
+        // clear them there (pc.sctp may read null by now, and left them set).
+        if(connection.sctp){
+          connection.sctp.onstatechange=null;
+          if(connection.sctp.transport){
+            connection.sctp.transport.onstatechange=null;
+            if(connection.sctp.transport.iceTransport){
+                connection.sctp.transport.iceTransport.onstatechange=null;
+                connection.sctp.transport.iceTransport.onselectedcandidatepairchange=null;
             }
           }
         }
@@ -4920,7 +5851,16 @@ export function StableWebRTC(opts){
       if('iceCandidatePoolSize' in opts2){
         connection.pc_config.iceCandidatePoolSize=opts2.iceCandidatePoolSize;
       }else{
-        connection.pc_config.iceCandidatePoolSize=1;
+        // 0 — no pre-gathering. It was 1: Chrome then starts a pooled gathering
+        // session when the pc is created, and the first setLocalDescription takes
+        // it over. Here the pc is used at once (the opening offer, or the answer
+        // to a buffered offer, within milliseconds), so the pool had no head start
+        // to save anything (first candidate ~90ms vs ~100ms) — and taken over
+        // mid-allocation, the session sometimes never produced a candidate at all:
+        // no candidate, no error, gathering stuck (Chrome simulation: 19 of 450
+        // with the pool, 0 of 300 without). Pass iceCandidatePoolSize to pre-gather
+        // for a pc created well before it is used.
+        connection.pc_config.iceCandidatePoolSize=0;
       }
 
       if('bundlePolicy' in opts2){
@@ -4947,6 +5887,9 @@ export function StableWebRTC(opts){
 
       if('gatheringTimeout' in opts2){
         connection.gathering_timeout_ms=Math.max(0,opts2.gatheringTimeout|0);
+      }
+      if('openingAnswerWait' in opts2){
+        connection.opening_answer_wait_ms=Math.max(0, opts2.openingAnswerWait|0);
       }
       if('gatheringMaxRetries' in opts2){
         connection.gathering_max_retries=Math.max(0,opts2.gatheringMaxRetries|0);
@@ -5071,6 +6014,7 @@ export function StableWebRTC(opts){
       try {
 
         connection.pc = new RTCPeerConnection(connection.pc_config);
+        if(T) tracePeerConnection(connection.pc, T);
 
         connection.pc.onicecandidate = function(event){
           if(connection.pc){
@@ -5187,6 +6131,13 @@ export function StableWebRTC(opts){
             clearTimeout(connection.ice_restart_timer);
             connection.ice_restart_timer=null;
 
+            // Back from a broken link (disconnected / failed → up again, by an
+            // ICE restart or on its own): re-send the stream map. Anything sent
+            // while the link was down may never have arrived.
+            if(prev_state==='disconnected' || prev_state==='failed'){
+              resend_mediastream_map();
+            }
+
             // Refund the restart budget only after the connection PROVES
             // stable. The previous immediate `ice_restart_count=0` turned a
             // flapping path (observed live: ~5s alive / ~10s dead cycles)
@@ -5298,6 +6249,23 @@ export function StableWebRTC(opts){
                   connection.gathering_timeout_timer=null;
                   if(!connection.pc) return;
                   if(connection.pc.iceGatheringState==='gathering'){
+                    // Gathering still open is NOT a stuck connection when ICE is
+                    // already working with what was gathered. Candidates trickle
+                    // to the peer one by one, so the pair can be checking or up
+                    // while one slow / unreachable STUN server keeps the
+                    // gathering state open (the 701 'server unreachable' that
+                    // onicecandidateerror treats as harmless). Restarting then
+                    // tore down a live connection — and, since the same server
+                    // stalls the next gathering too, retried until
+                    // gathering_max_retries and CLOSED it.
+                    // checking → ICE's own 'failed' handler recovers if the
+                    //            checks fail; connected/completed → nothing to fix.
+                    var ice_now=connection.pc.iceConnectionState;
+                    if(ice_now==='checking' || ice_now==='connected' || ice_now==='completed'){
+                      ev.emit('log','ICE gathering still open after '+connection.gathering_timeout_ms+
+                                    'ms, but ICE is '+ice_now+' — not restarting');
+                      return;
+                    }
                     // Still stuck
                     connection.gathering_retry_count++;
                     ev.emit('log','ICE gathering stuck — retry '+connection.gathering_retry_count+'/'+connection.gathering_max_retries);
@@ -5387,7 +6355,12 @@ export function StableWebRTC(opts){
         if (connection.pending_remote_offer_sdp!==null && connection.signaling_state=='stable' && connection.negotiation_state==0){
           set_remote_offer();
         }else{
-          var random_delay = 8 + Math.floor(Math.random() * 55); // 8-63ms
+          // The first data channel, on the next timer turn — not after a
+          // random 8-63ms stagger: that existed to make startup collisions
+          // rare, and a collision at the opening now costs nothing (the
+          // opening offer goes out unapplied — create_offer). The turn keeps
+          // a peer offer already queued in this tick ahead of us.
+          var random_delay = 0;
           function try_create_dc(){
             connection.create_data_channel_timer=null;
             if(pc_alive()){
@@ -5396,18 +6369,25 @@ export function StableWebRTC(opts){
               // pre-allocate the transport object, so check its state instead of
               // its mere existence.
               var sctp_not_up = (connection.pc.sctp==null || connection.pc.sctp.state!=='connected');
+              // Not when the peer's description already brings a data
+              // channel (m=application in an offer we answered): it arrives
+              // via ondatachannel once SCTP is up — one of ours would only
+              // open alongside it (see close_unopened_data_channels).
+              var rd = connection.pc.remoteDescription;
+              var peer_brings_dc = !!(rd && rd.type==='offer' && /^m=application/m.test(String(rd.sdp)));
               var need_dc = sctp_not_up
                 && (connection.list_data_channels.length==0)
                 && (connection.negotiation_state==0)
-                && (connection.pending_remote_offer_sdp==null);
+                && (connection.pending_remote_offer_sdp==null)
+                && !peer_brings_dc;
               if(need_dc){
                 create_data_channel();
               }else if(sctp_not_up && connection.list_data_channels.length==0){
-                connection.create_data_channel_timer=setTimeout(try_create_dc, 100);
+                connection.create_data_channel_timer=arm(try_create_dc, 100);
               }
             }
           }
-          connection.create_data_channel_timer=setTimeout(try_create_dc, random_delay);
+          connection.create_data_channel_timer=arm(try_create_dc, random_delay);
         }
 
         
@@ -5440,6 +6420,11 @@ export function StableWebRTC(opts){
 
       getConnectionInfo: function(){
         return build_connection_info();
+      },
+
+      // The connection's trace (opts.trace), or null when it is off.
+      getTrace: function(){
+        return T ? T.get() : null;
       },
 
       getStreams: function(direction){

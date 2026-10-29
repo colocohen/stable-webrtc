@@ -155,9 +155,9 @@ can be substituted if you prefer.
 
 ### Nonce-Based Role Resolution
 
-Both peers embed a random nonce in every signaling message. The peer with the higher nonce creates the DataChannel and sends the first offer. The other peer waits. No configuration needed — roles are locked before any SDP is generated, eliminating DataChannel glare and m-line ordering conflicts at the source.
+Both peers embed a random nonce in every signaling message; the peer with the higher nonce leads (impolite), the other yields (polite). No configuration needed (`negotiation_role: 'lead' | 'follow'` fixes it when the application knows who calls whom).
 
-To further reduce glare during startup, each peer waits a random 8–63ms before creating its DataChannel. This staggering ensures that in most cases, only one peer initiates before the nonce exchange resolves who should lead.
+**Opening without waiting, and without rollback.** At the very start neither peer knows the other's nonce — nothing has arrived yet. So both offer at once, but the opening offer is sent **before it is applied** (no `setLocalDescription` yet); it carries the nonce. If the offers cross, the polite peer simply drops its own — nothing was applied, nothing to roll back — and answers the other; the impolite peer applies its offer as soon as it sees the polite one, and the answer completes it. Two signaling trips, as if there had been no collision. When only one peer offers, it applies its offer right before the answer. A peer that already knows it is polite waits for the leader's offer (2.5s at most, then offers itself). When answering an opening offer that brings the peer's data channel, any never-opened channel of our own is closed — one data channel from the start.
 
 ### Serialized Negotiation
 
@@ -328,7 +328,11 @@ Full connection telemetry available via `peer.getConnectionInfo()`:
 ```js
 var info = peer.getConnectionInfo();
 // info.type             — 'direct-udp', 'direct-tcp', 'relayed', 'unknown'
-// info.rtt              — round-trip time (ms)
+// info.rtt              — ICE round-trip time from getStats (ms) — coarse, see below
+// info.ping_rtt         — last DataChannel round trip from the ping/pong probe (ms)
+// info.srtt             — smoothed ping_rtt: the current round trip, queues included
+// info.min_rtt          — lowest ping_rtt on the current path: the line itself, without
+//                         queues (reset when the selected path changes)
 // info.bandwidth_outgoing — estimated outgoing bandwidth (bits/sec)
 // info.local.ip         — local IP address
 // info.local.port       — local port
@@ -340,6 +344,26 @@ var info = peer.getConnectionInfo();
 // For network-level characterization (NAT, public IP, UDP support),
 // listen to the `networkprofile` event — see "Network Profiling" above.
 ```
+
+`srtt − min_rtt` is the time spent waiting in queues along the way — it grows with the load on the path. `info.rtt` comes from the browser's ICE checks, sampled every few seconds at millisecond resolution (0 on a local path); prefer the ping-based values.
+
+### Connection Trace (debugging)
+
+With `trace` on, the connection records everything it does, as JSON: the `RTCPeerConnection` calls and their results (SDP in full the first time in each direction, then as the lines that changed), its events and every ICE candidate, the library's own signaling (`signal.out` / `signal.in` with message type, size and path), negotiation state, its decisions (`diag`), errors, re-sends, RTT samples, `getStats` (only what changed; every second for the first 30s and around events, every 5s otherwise), the send queues, and machine load — `cpu: { state }` from the Compute Pressure API in Chromium, `cpu: { elu }` (event-loop utilization) in Node. Nothing of this runs when it is off.
+
+```js
+var peer = new StableWebRTC({ trace: function(entry){ /* each entry as it happens */ } });
+// or { trace: true }, or { trace: { onEntry, head: 2000, tail: 5000 } }
+var dump = peer.getTrace();   // { format, version, startedAt, dropped, entries: [{ t, ev, d }, ...] }
+```
+
+**Media.** A `media` entry each time an RTP stream's picture changes — every `getStats` poll is checked, not only the recorded ones: `{ dir: 'send'|'recv', kind, mid, tag, rid, state, codec, width, height, fps, limit, active }`. `state` is `flowing`, `stalled` (it was flowing and stopped — the one to look for), `off` (a sender or simulcast layer switched off with `active: false`), `removed` (its tagged stream was taken off), `none` or `gone`; `limit` is the encoder's `qualityLimitationReason` (`cpu`, `bandwidth`). Each simulcast layer is a stream of its own, by `rid`. With them: `replaceTrack` and `setParameters` (the encodings in full) on every sender, a transceiver's `direction` changes, `stop()` and `setCodecPreferences()`, and every track's `mute` / `unmute` / `ended`, local and remote.
+
+**ICE.** Every candidate gathered (`onicecandidate`, with the STUN/TURN server it came from) and every gathering error (`onicecandidateerror`), every remote candidate added, and an `ice.pair` entry each time a candidate pair's state changes: `{ pair, state, from, nominated, selected, local, remote, rtt, requestsSent, responsesReceived, requestsReceived, responsesSent }`, where `local` / `remote` are `{ type, protocol, address, port, relayProtocol, url }` and `state` is `frozen`, `waiting`, `in-progress`, `succeeded`, `failed` or `gone` (the pair was dropped). While ICE is checking (or disconnected and looking for a path) the pairs are sampled every 100ms, so the checks show step by step; otherwise at every `getStats` poll. The selected pair's counters are in the `getStats` entries.
+
+**Both sides of a connection.** Once the other side is known, a `peer` entry carries both nonces and both DTLS fingerprints, and `pair` — a string that is the same in both sides' traces — so the two halves of one connection can be found and read side by side. Each `rtt` entry carries `clock_offset`: the other side's clock minus this one's (ms), estimated from the ping/pong with the shortest round trip so far (accurate to ± `clock_offset_rtt` / 2), so the two traces' timestamps can be put on one clock.
+
+Bounded as a head and a tail: the first `head` entries (how the connection came up) and the last `tail`, with a `trace.dropped` entry for what was let go between them. The hook is called with each entry as it is made, so a trace can be streamed out — to a Service Worker, say — and survive the tab being closed. IP addresses are kept as they are; ICE server credentials are not recorded.
 
 ### Stream Telemetry
 
@@ -450,6 +474,7 @@ var peer = new StableWebRTC(options);
 | `pingIntervalMin` / `pingIntervalMax` | Number | `1000` / `3000` | Randomised ping interval bounds (ms) |
 | `liveness` | Boolean | `true` | Watchdog: declares the link dead after `livenessTimeout` ms with no inbound traffic (crucial for ICE-lite peers) |
 | `livenessTimeout` | Number | `10000` | ms of inbound silence before recovery/close (min 2000) |
+| `trace` | Boolean \| Function \| Object | off | Record a [connection trace](#connection-trace-debugging): `true`, a hook `function(entry)`, or `{ onEntry, head, tail }` |
 
 ### Properties
 
@@ -477,6 +502,7 @@ var peer = new StableWebRTC(options);
 | `peer.restartIce()` | Manually trigger an ICE restart |
 | `peer.setConfiguration(config)` | Update the underlying `RTCPeerConnection` configuration |
 | `peer.getConnectionInfo()` | Returns connection telemetry (type, RTT, bandwidth, endpoints) |
+| `peer.getTrace()` | The [connection trace](#connection-trace-debugging), or `null` when `trace` is off |
 | `peer.getStreams(direction?)` | Returns all streams with stats. Optional filter: `'sending'` or `'receiving'` |
 | `peer.on(event, fn)` | Subscribe to an event |
 | `peer.off(event, fn)` | Unsubscribe from an event (same reference required) |
@@ -495,7 +521,7 @@ var peer = new StableWebRTC(options);
 | `networkprofile` | `profile` | Local network characterized. `{ public_ipv4, public_ipv6, all_public_ipv4, all_public_ipv6, local_ipv4, symmetric_nat, supports_udp, supports_tcp, needs_relay }` |
 | `streamstats` | `tagId, direction, stats` | Per-stream stats updated. `direction`: `'sending'` or `'receiving'`. `stats: { video: { active, width, height, fps, codec, bitrate, packetLoss, jitter }, audio: { active, codec, bitrate, packetLoss, jitter } }` |
 | `drain` | — | The outgoing app-data queue emptied via sends — safe to resume writing (pairs with `peer.bufferedAmount`) |
-| `rtt` | `ms` | App-level DataChannel round-trip time measured by the ping/pong probe |
+| `rtt` | `ms, { sample, srtt, rttvar, min_rtt, clock_offset, clock_offset_rtt }` | App-level DataChannel round-trip time measured by the ping/pong probe; the second argument adds the smoothed value and the lowest on this path |
 | `disconnect` | `{ reason, restartCount }` | Connection lost. `reason`: `'disconnected'` / `'failed'` (from ICE) or `'timeout'` (liveness watchdog — no inbound traffic). Automatic ICE restart begins. |
 | `reconnect` | — | ICE connection recovered after a disconnect |
 | `fingerprints` | `localFP, remoteFP` | DTLS fingerprints available for identity verification |

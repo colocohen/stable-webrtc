@@ -254,3 +254,45 @@ export function is_public_ip(a) {
   }
 
 
+
+// Run fn on the next turn of the event loop — a task, not a timer — and
+// return a function that cancels it.
+//
+// For work that should happen "as soon as possible, after the current one":
+// setTimeout(fn, 0) does that only while the page is visible. In a hidden tab
+// Chrome lets timers run at most once a second (once a minute after five
+// minutes, unless WebRTC is in use), and even in a visible one a chain of
+// zero-delay timers is clamped to 4 ms from the fifth on. A MessageChannel
+// message is a task of its own, and no timer.
+//   Node / Bun: setImmediate — runs after pending I/O, and a MessagePort
+//               would keep the process alive;
+//   browser, Web Worker: one shared MessageChannel, its messages in order;
+//   neither: setTimeout(fn, 0).
+export var defer_task = (function () {
+  if (typeof setImmediate === 'function') {
+    return function (fn) {
+      var h = setImmediate(fn);
+      return function () { clearImmediate(h); };
+    };
+  }
+  if (typeof MessageChannel === 'function') {
+    var ch = new MessageChannel();
+    var q = [], head = 0;
+    ch.port1.onmessage = function () {
+      var item = q[head];
+      q[head++] = undefined;
+      if (head === q.length) { q.length = 0; head = 0; }
+      if (item && item.fn) { var f = item.fn; item.fn = null; f(); }
+    };
+    return function (fn) {
+      var item = { fn: fn };
+      q.push(item);
+      ch.port2.postMessage(0);
+      return function () { item.fn = null; };
+    };
+  }
+  return function (fn) {
+    var h = setTimeout(fn, 0);
+    return function () { clearTimeout(h); };
+  };
+})();
